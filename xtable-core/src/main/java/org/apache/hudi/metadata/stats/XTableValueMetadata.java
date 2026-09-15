@@ -16,7 +16,7 @@
  * limitations under the License.
  */
  
-package org.apache.hudi.stats;
+package org.apache.hudi.metadata.stats;
 
 import static org.apache.xtable.model.schema.InternalSchema.MetadataKey.TIMESTAMP_PRECISION;
 import static org.apache.xtable.model.schema.InternalSchema.MetadataValue.MICROS;
@@ -139,6 +139,9 @@ public class XTableValueMetadata {
         } else {
           return ValueType.LOCAL_TIMESTAMP_MILLIS;
         }
+      case VARIANT:
+        throw new UnsupportedOperationException(
+            "Variant columns have no column statistics in Hudi");
       default:
         throw new UnsupportedOperationException(
             "InternalType " + internalSchema.getDataType() + " is not supported");
