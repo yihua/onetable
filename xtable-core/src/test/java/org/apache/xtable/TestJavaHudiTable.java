@@ -40,12 +40,12 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.hadoop.conf.Configuration;
 
-import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.client.HoodieJavaWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.clustering.plan.strategy.JavaSizeBasedClusteringPlanStrategy;
 import org.apache.hudi.client.clustering.run.strategy.JavaSortAndSizeExecutionStrategy;
 import org.apache.hudi.client.common.HoodieJavaEngineContext;
+import org.apache.hudi.common.avro.HoodieAvroUtils;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.HoodieAvroPayload;
@@ -226,6 +226,43 @@ public class TestJavaHudiTable extends TestAbstractHudiTable {
         tableName, schema, tempDir, partitionConfig, tableType, null, false, new Properties());
   }
 
+  /**
+   * A table with a caller-supplied schema and table-level properties, for probes that need both a
+   * custom column type and a pluggable table format configuration.
+   */
+  public static TestJavaHudiTable withSchema(
+      String tableName,
+      Path tempDir,
+      String partitionConfig,
+      HoodieTableType tableType,
+      Schema schema,
+      Properties tableProperties) {
+    return new TestJavaHudiTable(
+        tableName, schema, tempDir, partitionConfig, tableType, null, false, tableProperties);
+  }
+
+  /**
+   * Same as {@link #forStandardSchema(String, Path, String, HoodieTableType, Properties)}, but Hudi
+   * receives the base path without a scheme ({@code /tmp/t} rather than {@code file:/tmp/t}).
+   */
+  public static TestJavaHudiTable forStandardSchemaWithSchemeLessBasePath(
+      String tableName,
+      Path tempDir,
+      String partitionConfig,
+      HoodieTableType tableType,
+      Properties tableProperties) {
+    return new TestJavaHudiTable(
+        tableName,
+        BASIC_SCHEMA,
+        tempDir,
+        partitionConfig,
+        tableType,
+        null,
+        false,
+        tableProperties,
+        true);
+  }
+
   private TestJavaHudiTable(
       String name,
       Schema schema,
@@ -235,7 +272,29 @@ public class TestJavaHudiTable extends TestAbstractHudiTable {
       HoodieArchivalConfig archivalConfig,
       boolean addFieldIds,
       Properties tableProperties) {
-    super(name, schema, tempDir, partitionConfig);
+    this(
+        name,
+        schema,
+        tempDir,
+        partitionConfig,
+        hoodieTableType,
+        archivalConfig,
+        addFieldIds,
+        tableProperties,
+        false);
+  }
+
+  private TestJavaHudiTable(
+      String name,
+      Schema schema,
+      Path tempDir,
+      String partitionConfig,
+      HoodieTableType hoodieTableType,
+      HoodieArchivalConfig archivalConfig,
+      boolean addFieldIds,
+      Properties tableProperties,
+      boolean schemeLessBasePath) {
+    super(name, schema, tempDir, partitionConfig, schemeLessBasePath);
     this.conf = new Configuration();
     this.conf.set("parquet.avro.write-old-list-structure", "false");
     // xtable-prefixed properties configure the pluggable table format, which reads them from the
@@ -279,6 +338,30 @@ public class TestJavaHudiTable extends TestAbstractHudiTable {
       assertNoWriteErrors(result);
     }
     return updates;
+  }
+
+  /** Writes the given records unchanged as an insert commit. */
+  public List<HoodieRecord<HoodieAvroPayload>> insertRecordsAsIs(
+      List<HoodieRecord<HoodieAvroPayload>> records, boolean checkForNoErrors) {
+    String commitInstant = getStartCommitInstant();
+    List<WriteStatus> result = writeClient.insert(copyRecords(records), commitInstant);
+    writeClient.commit(commitInstant, result);
+    if (checkForNoErrors) {
+      assertNoWriteErrors(result);
+    }
+    return records;
+  }
+
+  /** Writes the given records unchanged as an upsert commit (the merge write path). */
+  public List<HoodieRecord<HoodieAvroPayload>> upsertRecordsAsIs(
+      List<HoodieRecord<HoodieAvroPayload>> records, boolean checkForNoErrors) {
+    String commitInstant = getStartCommitInstant();
+    List<WriteStatus> result = writeClient.upsert(copyRecords(records), commitInstant);
+    writeClient.commit(commitInstant, result);
+    if (checkForNoErrors) {
+      assertNoWriteErrors(result);
+    }
+    return records;
   }
 
   public List<HoodieKey> deleteRecords(

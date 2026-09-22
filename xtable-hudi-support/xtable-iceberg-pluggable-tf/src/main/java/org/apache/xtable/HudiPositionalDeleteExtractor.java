@@ -24,7 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.roaringbitmap.longlong.Roaring64NavigableMap;
+import org.apache.hadoop.conf.Configuration;
 
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieBaseFile;
@@ -44,6 +44,7 @@ import org.apache.hudi.storage.StoragePath;
 
 import org.apache.xtable.exception.NotSupportedException;
 import org.apache.xtable.exception.ReadException;
+import org.apache.xtable.hudi.HudiFilePaths;
 
 /**
  * Extracts positional deletes from the log files of a Hudi merge-on-read deltacommit so they can be
@@ -98,8 +99,7 @@ class HudiPositionalDeleteExtractor {
       HoodieSchema schema,
       SyncableFileSystemView fsView,
       Map<String, List<Long>> positionsByDataFile) {
-    try (HoodieLogFormat.Reader reader =
-        HoodieLogFormat.newReader(metaClient.getStorage(), logFile, schema)) {
+    try (HoodieLogFormat.Reader reader = HoodieLogFormat.newReader(metaClient, logFile, schema)) {
       while (reader.hasNext()) {
         HoodieLogBlock block = reader.next();
         if (!(block instanceof HoodieDeleteBlock)) {
@@ -111,17 +111,21 @@ class HudiPositionalDeleteExtractor {
                   + logFile.getPath());
         }
         HoodieDeleteBlock deleteBlock = (HoodieDeleteBlock) block;
-        Roaring64NavigableMap positions = deleteBlock.getRecordPositions();
+        List<Long> positions = deleteBlock.getRecordPositionList();
         int deleteCount = deleteBlock.getRecordsToDelete().length;
-        if (positions == null || positions.getLongCardinality() != deleteCount) {
+        if (positions == null || positions.size() != deleteCount) {
           throw new NotSupportedException(
               "Delete blocks must carry one valid record position per deleted record to be "
                   + "represented as an Iceberg deletion vector: "
                   + logFile.getPath());
         }
         String baseFileInstant = deleteBlock.getBaseFileInstantTimeOfPositions();
+        // qualified the same way as the data file paths registered in Iceberg, which the
+        // deletion vectors are matched against
         String baseFilePath =
-            resolveBaseFilePath(fsView, partitionPath, fileId, baseFileInstant, logFile);
+            HudiFilePaths.qualify(
+                resolveBaseFilePath(fsView, partitionPath, fileId, baseFileInstant, logFile),
+                (Configuration) metaClient.getStorageConf().unwrap());
         List<Long> collected =
             positionsByDataFile.computeIfAbsent(baseFilePath, ignored -> new ArrayList<>());
         positions.forEach(collected::add);
