@@ -499,11 +499,17 @@ public class ParquetSchemaExtractor {
                     field ->
                         fromInternalSchema(
                             field.getSchema(),
-                            SchemaUtils.getFullyQualifiedPath(field.getName(), currentPath)))
+                            SchemaUtils.getFullyQualifiedPath(currentPath, field.getName())))
                 .collect(CustomCollectors.toList(internalSchema.getFields().size()));
         type =
             Types.requiredGroup().addFields(fields.stream().toArray(Type[]::new)).named(fieldName);
         break;
+      case VARIANT:
+        throw new UnsupportedSchemaTypeException(
+            String.format(
+                "Variant column %s cannot be represented as a Parquet type; variant columns are only"
+                    + " supported when syncing to Iceberg",
+                currentPath));
       default:
         throw new UnsupportedSchemaTypeException(
             "Encountered unhandled type during InternalSchema to parquet conversion:"
