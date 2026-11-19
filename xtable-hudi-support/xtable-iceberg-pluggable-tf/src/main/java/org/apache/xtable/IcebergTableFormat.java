@@ -62,7 +62,6 @@ import org.apache.hudi.metadata.TableMetadataFactory;
 
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.catalog.TableIdentifier;
 
 import org.apache.xtable.conversion.ConversionTargetFactory;
 import org.apache.xtable.conversion.SourceTable;
@@ -109,13 +108,15 @@ public class IcebergTableFormat implements HoodieTableFormat {
 
   /**
    * Hudi passes the table's {@code hoodie.properties} here on every meta client load, which is the
-   * earliest point an unsupported table shape can be refused: before any instant exists.
+   * earliest point an unsupported table shape or invalid Iceberg settings can be refused: before
+   * any instant exists.
    */
   @Override
   public void init(Properties properties) {
     HoodieConfig tableConfig = new HoodieConfig(TypedProperties.copy(properties));
     requireCopyOnWrite(tableConfig);
     requireTableVersionEightOrLater(tableConfig);
+    IcebergFormatConfig.of(properties, null);
     this.tableFormatSync = TableFormatSync.getInstance();
   }
 
@@ -314,11 +315,14 @@ public class IcebergTableFormat implements HoodieTableFormat {
 
   private InternalTable tableAsRecordedInIceberg(
       HoodieTableMetaClient metaClient, HoodieInstant instant) {
+    IcebergFormatConfig config = IcebergFormatConfig.of(metaClient);
     SourceTable icebergTable =
         SourceTable.builder()
             .name(metaClient.getTableConfig().getTableName())
             .formatName(org.apache.xtable.model.storage.TableFormat.ICEBERG)
             .basePath(metaClient.getBasePath().toString())
+            .namespace(config.getNamespace())
+            .catalogConfig(config.getCatalogConfig())
             .build();
     InternalTable current =
         IcebergConversionSource.builder()
@@ -339,19 +343,17 @@ public class IcebergTableFormat implements HoodieTableFormat {
   }
 
   private static boolean icebergTableExists(HoodieTableMetaClient metaClient) {
-    return IcebergTableManager.of((Configuration) metaClient.getStorageConf().unwrap())
+    return IcebergFormatConfig.of(metaClient)
         .tableExists(
-            null,
-            TableIdentifier.of(metaClient.getTableConfig().getTableName()),
-            metaClient.getBasePath().toString());
+            IcebergTableManager.of((Configuration) metaClient.getStorageConf().unwrap()),
+            metaClient);
   }
 
   private static Table icebergTable(HoodieTableMetaClient metaClient) {
-    return IcebergTableManager.of((Configuration) metaClient.getStorageConf().unwrap())
+    return IcebergFormatConfig.of(metaClient)
         .getTable(
-            null,
-            TableIdentifier.of(metaClient.getTableConfig().getTableName()),
-            metaClient.getBasePath().toString());
+            IcebergTableManager.of((Configuration) metaClient.getStorageConf().unwrap()),
+            metaClient);
   }
 
   /**
@@ -572,10 +574,13 @@ public class IcebergTableFormat implements HoodieTableFormat {
   }
 
   private IcebergConversionTarget getIcebergConversionTarget(HoodieTableMetaClient metaClient) {
-    // TODO: Add iceberg catalog config through user inputs.
+    IcebergFormatConfig config = IcebergFormatConfig.of(metaClient);
     TargetTable targetTable =
-        targetTable(
-            metaClient.getTableConfig().getTableName(), metaClient.getBasePath().toString());
+        targetTable(metaClient.getTableConfig().getTableName(), metaClient.getBasePath().toString())
+            .toBuilder()
+            .namespace(config.getNamespace())
+            .catalogConfig(config.getCatalogConfig())
+            .build();
     return (IcebergConversionTarget)
         ConversionTargetFactory.getInstance()
             .createForFormat(targetTable, (Configuration) metaClient.getStorageConf().unwrap());
