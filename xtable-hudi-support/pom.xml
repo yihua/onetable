@@ -34,4 +34,14 @@
         <module>xtable-hudi-support-extensions</module>
         <module>xtable-iceberg-pluggable-tf</module>
     </modules>
+
+    <profiles>
+        <!-- The parity suites are copied from Iceberg's Spark 3.5 tests and need that Spark -->
+        <profile>
+            <id>spark3.5</id>
+            <modules>
+                <module>xtable-iceberg-ptf-parity</module>
+            </modules>
+        </profile>
+    </profiles>
 </project>
