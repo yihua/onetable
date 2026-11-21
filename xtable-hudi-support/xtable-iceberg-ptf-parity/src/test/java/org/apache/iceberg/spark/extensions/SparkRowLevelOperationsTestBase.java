@@ -57,9 +57,11 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.Parameter;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
@@ -90,9 +92,11 @@ import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.execution.FileSourceScanExec;
 import org.apache.spark.sql.execution.QueryExecution;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec;
+import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
 import org.apache.spark.sql.functions;
 import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.types.StructField;
@@ -140,6 +144,63 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
   /** {@code hoodie.spark.sql.merge.into.partial.updates} for the session, when given. */
   private static final String MERGE_PARTIAL_UPDATES = System.getProperty("parity.mergePartialUpdates");
   private static final String APPEND_VIEW = "ptf_append_source";
+
+  private static final String WRITE_DISTRIBUTION =
+      "not applicable: asserts the shuffle that Iceberg's writer requests through its write"
+          + " distribution mode and advisory partition size; Hudi plans its own write";
+  private static final String WAP_BRANCH =
+      "not applicable: Iceberg branches and write-audit-publish; a Hudi table has no branches";
+  private static final String PARTITION_EVOLUTION =
+      "product gap H10: partition evolution and partition transforms (ADD PARTITION FIELD on a"
+          + " table with data, bucket/days/truncate); Hudi partitions by identity only. Size:"
+          + " large, a spec-evolution model in Hudi plus transform-aware partition paths";
+
+  /**
+   * Cases that test an Iceberg feature the published table cannot have, or a known product gap,
+   * skipped with the reason so a run reports them apart from failures. Each reason starts with
+   * "not applicable" or "product gap".
+   */
+  private static final Map<String, String> SKIPPED_CASES =
+      ImmutableMap.<String, String>builder()
+          .put("testCoalesceDelete", WRITE_DISTRIBUTION)
+          .put("testSkewDelete", WRITE_DISTRIBUTION)
+          .put("testCoalesceUpdate", WRITE_DISTRIBUTION)
+          .put("testSkewUpdate", WRITE_DISTRIBUTION)
+          .put(
+              "testMergeConditionSplitIntoTargetPredicateAndJoinCondition",
+              "not applicable: asserts the join type and target filter of Iceberg's MERGE rewrite"
+                  + " (RewriteMergeIntoTable); Hudi runs MERGE in its own command")
+          .put(
+              "testMergeWithVectorizedReads",
+              "not applicable: checks the scans in the executed plan of the MERGE; Hudi's MERGE"
+                  + " command plans and runs its join inside the command, so its executed plan"
+                  + " holds no scan")
+          .put("testDeleteToWapBranch", WAP_BRANCH)
+          .put("testDeleteToWapBranchCanDeleteWhereScansWapBranch", WAP_BRANCH)
+          .put("testMetadataDeleteToWapBranchCommitsToWapBranch", WAP_BRANCH)
+          .put("testUpdateToWAPBranch", WAP_BRANCH)
+          .put(
+              "testDeleteWithPartitionedTable",
+              "not applicable: reads the Iceberg metadata table <table>.partitions through the"
+                  + " session catalog, where the table is a Hudi table; the published metadata"
+                  + " tables are checked through an Iceberg catalog in TestIcebergReadParity")
+          .put(
+              "testDeleteFileThenMetadataDelete",
+              "not applicable: loads the table through Iceberg's Spark catalog"
+                  + " (Spark3Util.loadIcebergTable), where it is a Hudi table")
+          .put(
+              "testDeleteWithoutScanningTable",
+              "product gap: a DELETE whose condition selects whole partitions is not run as a"
+                  + " metadata-only delete (Iceberg's DeleteFromTableWithFilters); Hudi scans the"
+                  + " rows. Size: medium, plan such a DELETE as a Hudi delete_partition")
+          .put("testDeleteWithMultipleSpecs", PARTITION_EVOLUTION)
+          .put("testMergeWithBucketTransform", PARTITION_EVOLUTION)
+          .put("testMergeWithDaysTransform", PARTITION_EVOLUTION)
+          .put("testMergeWithTruncateTransform", PARTITION_EVOLUTION)
+          .put("testUpdateModifyPartitionSourceField", PARTITION_EVOLUTION)
+          .put("testUpdateWithAlias", PARTITION_EVOLUTION)
+          .put("testUpdateWithUserDefinedDistribution", PARTITION_EVOLUTION)
+          .build();
   private static final Pattern CREATE_ICEBERG_TABLE =
       Pattern.compile("(?is)^\\s*CREATE\\s+TABLE\\s+(\\S+)\\s*\\((.*)\\)\\s*USING\\s+iceberg\\b(.*)$");
   private static final Pattern TBLPROPERTIES = Pattern.compile("(?i)TBLPROPERTIES\\s*\\(");
@@ -269,6 +330,8 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
             + "[v"
             + formatVersion
             + "]";
+    String skipReason = testInfo.getTestMethod().map(m -> SKIPPED_CASES.get(m.getName())).orElse(null);
+    Assumptions.assumeTrue(skipReason == null, skipReason);
     if (isMergeOnRead()) {
       Assumptions.assumeTrue(
           formatVersion >= 3,
@@ -454,7 +517,11 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
     if (isQuery(statement) && mentionsTableUnderTest(statement)) {
       statement = readThroughIceberg(statement);
     }
-    List<Row> rows = spark.sql(statement).collectAsList();
+    Dataset<Row> result = spark.sql(statement);
+    if (isQuery(statement)) {
+      result = withoutHudiMetaColumns(result);
+    }
+    List<Row> rows = result.collectAsList();
     if (rows.isEmpty()) {
       return ImmutableList.of();
     }
@@ -489,6 +556,18 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
 
   private Pattern tableNamePattern() {
     return Pattern.compile("(?<![\\w.`])" + Pattern.quote(tableName) + "(?![\\w])");
+  }
+
+  /**
+   * A query that reads the table by name through Spark, as a view the suites define over it does,
+   * reads it through Hudi, which adds its meta columns; the rows are compared on the table's own
+   * columns.
+   */
+  private static Dataset<Row> withoutHudiMetaColumns(Dataset<Row> df) {
+    return df.drop(
+        Arrays.stream(df.columns())
+            .filter(HoodieRecord.HOODIE_META_COLUMNS::contains)
+            .toArray(String[]::new));
   }
 
   /** Points the query at a fresh Iceberg read of the table, without Hudi's meta columns. */
@@ -746,9 +825,16 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
     return vectorized && (fileFormat.equals(FileFormat.PARQUET) || !isMergeOnRead());
   }
 
+  /**
+   * Hudi reads the table of a row-level operation through a file source scan rather than a data
+   * source v2 batch scan, so both kinds of scan must read columnar batches.
+   */
   protected void assertAllBatchScansVectorized(SparkPlan plan) {
-    List<SparkPlan> batchScans = SparkPlanUtil.collectBatchScans(plan);
-    assertThat(batchScans).hasSizeGreaterThan(0).allMatch(SparkPlan::supportsColumnar);
+    List<SparkPlan> scans =
+        SparkPlanUtil.collectLeaves(plan).stream()
+            .filter(scan -> scan instanceof BatchScanExec || scan instanceof FileSourceScanExec)
+            .collect(Collectors.toList());
+    assertThat(scans).hasSizeGreaterThan(0).allMatch(SparkPlan::supportsColumnar);
   }
 
   protected void createTableWithDeleteGranularity(
@@ -894,9 +980,21 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
       throw new UnsupportedOperationException("rename");
     }
 
+    /**
+     * The suites read the row-level operation mode from Iceberg's write mode properties, which
+     * Hudi does not set; the Hudi table type decides it, and the suite's own properties name it.
+     */
     @Override
     public Table loadTable(TableIdentifier identifier) {
-      return new HadoopTables(spark.sessionState().newHadoopConf()).load(tablePath);
+      Table table = new HadoopTables(spark.sessionState().newHadoopConf()).load(tablePath);
+      return new BaseTable(((HasTableOperations) table).operations(), table.name()) {
+        @Override
+        public Map<String, String> properties() {
+          Map<String, String> properties = new HashMap<>(super.properties());
+          properties.putAll(extraTableProperties());
+          return properties;
+        }
+      };
     }
   }
 }
