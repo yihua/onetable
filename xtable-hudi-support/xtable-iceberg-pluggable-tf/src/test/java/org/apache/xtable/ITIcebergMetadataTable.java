@@ -21,6 +21,7 @@ package org.apache.xtable;
 import static org.apache.hudi.hadoop.fs.HadoopFSUtils.getStorageConf;
 import static org.apache.xtable.IcebergTableAssertions.assertIcebergReferencesExactly;
 import static org.apache.xtable.IcebergTableAssertions.assertNothingPending;
+import static org.apache.xtable.IcebergTableAssertions.baseFilesWithRows;
 import static org.apache.xtable.IcebergTableAssertions.icebergRowCount;
 import static org.apache.xtable.IcebergTableAssertions.reconstructedTimeline;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -128,12 +129,16 @@ class ITIcebergMetadataTable {
 
       table.upsertRecords(inserts.subList(0, 30), true);
       table.deleteRecords(inserts.subList(30, 40), true);
-      assertIcebergReferencesExactly(table.getBasePath(), table.getAllLatestBaseFilePaths());
+      assertIcebergReferencesExactly(
+          table.getBasePath(),
+          baseFilesWithRows(table.getMetaClient(), table.getAllLatestBaseFilePaths()));
       assertEquals(90, icebergRowCount(table.getBasePath()));
       assertEquals(3, tableMetadata(table).getAllPartitionPaths().size());
 
       table.cluster();
-      assertIcebergReferencesExactly(table.getBasePath(), table.getAllLatestBaseFilePaths());
+      assertIcebergReferencesExactly(
+          table.getBasePath(),
+          baseFilesWithRows(table.getMetaClient(), table.getAllLatestBaseFilePaths()));
       assertEquals(90, icebergRowCount(table.getBasePath()));
       assertNothingPending(reconstructedTimeline(table.getBasePath()));
     }
