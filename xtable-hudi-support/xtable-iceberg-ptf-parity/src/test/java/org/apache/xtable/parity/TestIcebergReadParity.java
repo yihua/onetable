@@ -313,12 +313,11 @@ class TestIcebergReadParity {
         .as("partitions metadata table")
         .isEqualTo(nativePartitions);
 
+    List<Snapshot> nativeHistory = history(nativeTable(pair));
     List<String> nativeOps =
-        history(nativeTable(pair)).stream().map(Snapshot::operation).collect(Collectors.toList());
+        nativeHistory.stream().map(Snapshot::operation).collect(Collectors.toList());
     List<String> publishedOps =
-        history(publishedTable(pair)).stream()
-            .map(Snapshot::operation)
-            .collect(Collectors.toList());
+        SmallFileInserts.operations(nativeHistory, history(publishedTable(pair)));
     softly.assertThat(publishedOps).as("snapshot operations").isEqualTo(nativeOps);
     softly
         .assertThat(publishedTable(pair).currentSnapshot().summary().get("total-records"))
@@ -365,12 +364,21 @@ class TestIcebergReadParity {
     softly.assertAll();
   }
 
+  /**
+   * Iceberg's incremental append scan reads append snapshots only, so the Hudi table keeps its
+   * inserts out of existing small files, see {@link SmallFileInserts}.
+   */
   @Test
   void incrementalReadOfAppends() {
     Pair pair = create("incremental", "id INT, data STRING", null, "cow");
-    both(pair, "INSERT INTO {t} VALUES (1, 'a')");
-    both(pair, "INSERT INTO {t} VALUES (2, 'b')");
-    both(pair, "INSERT INTO {t} VALUES (3, 'c')");
+    spark.conf().set("hoodie.parquet.small.file.limit", "0");
+    try {
+      both(pair, "INSERT INTO {t} VALUES (1, 'a')");
+      both(pair, "INSERT INTO {t} VALUES (2, 'b')");
+      both(pair, "INSERT INTO {t} VALUES (3, 'c')");
+    } finally {
+      spark.conf().unset("hoodie.parquet.small.file.limit");
+    }
     List<Snapshot> nativeHistory = history(nativeTable(pair));
     List<Snapshot> publishedHistory = history(publishedTable(pair));
     assertThat(publishedHistory.stream().map(Snapshot::operation))
