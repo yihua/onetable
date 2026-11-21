@@ -544,10 +544,10 @@ class ITIcebergMetaColumns {
       List<HoodieRecord<HoodieAvroPayload>> inserts = table.insertRecords(20, true);
       assertEquals(3, TableUtil.formatVersion(icebergTable(basePath)));
       String insertedBaseFile = table.getAllLatestBaseFilePaths().get(0);
-      assertFalse(
-          parquetColumns(table.getMetaClient(), insertedBaseFile)
-              .contains(MetadataColumns.ROW_ID.name()),
-          "an insert stores no row lineage");
+      List<String> insertedColumns = parquetColumns(table.getMetaClient(), insertedBaseFile);
+      assertTrue(
+          insertedColumns.containsAll(ROW_LINEAGE_COLUMNS),
+          "an insert stores the row lineage columns, null for its new rows: " + insertedColumns);
       Map<String, RowLineage> before = rowLineage(spark, basePath);
       assertEquals(20, before.size());
 
