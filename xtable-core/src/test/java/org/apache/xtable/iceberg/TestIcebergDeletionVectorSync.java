@@ -487,6 +487,95 @@ class TestIcebergDeletionVectorSync {
                 table, Arrays.asList(unknown), Collections.emptyMap(), false, aHoldsNoLiveRows));
   }
 
+  /** Commits the rewrite unless the sync leaves it to the caller, returning what the sync did. */
+  private Set<String> rewrite(
+      Table table,
+      List<InternalDataFile> added,
+      List<InternalDataFile> removed,
+      Map<String, List<Long>> deletedPositions,
+      Predicate<String> withoutLiveRows) {
+    Transaction transaction = table.newTransaction();
+    Set<String> deletionVectorFiles =
+        sync.applyRewrite(
+            table,
+            transaction,
+            InternalFilesDiff.builder().filesAdded(added).filesRemoved(removed).build(),
+            deletedPositions,
+            withoutLiveRows,
+            transaction.table().schema(),
+            transaction.table().spec(),
+            TableSyncMetadata.of(Instant.now(), Collections.emptyList()));
+    if (deletionVectorFiles != null) {
+      transaction.commitTransaction();
+    }
+    table.refresh();
+    return deletionVectorFiles;
+  }
+
+  @Test
+  void aRewriteIsAReplaceWhoseFilesKeepTheStartingSequenceNumber() {
+    Table table = newTable(3);
+    InternalDataFile a = dataFile(table, "a");
+    InternalDataFile b = dataFile(table, "b");
+    apply(table, Arrays.asList(a, b), Collections.emptyList(), positions(a, 1L, 2L), false);
+    long startingSequenceNumber = table.currentSnapshot().sequenceNumber();
+
+    InternalDataFile c = dataFile(table, "c");
+    InternalDataFile d = dataFile(table, "d");
+    assertEquals(
+        1, rewrite(table, Arrays.asList(c, d), Arrays.asList(a, b), positions(c, 4L), null).size());
+    assertEquals(expected("c", Arrays.asList(4L), "d", Arrays.asList()), deletedPositions(table));
+    Snapshot replace = table.currentSnapshot();
+    assertEquals(DataOperations.REPLACE, replace.operation());
+    assertEquals("2", replace.summary().get(SnapshotSummary.DELETED_FILES_PROP));
+    assertEquals("1", replace.summary().get(SnapshotSummary.REMOVED_DVS_PROP));
+    assertEquals("1", replace.summary().get(SnapshotSummary.ADDED_DVS_PROP));
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        assertEquals(startingSequenceNumber, task.file().dataSequenceNumber());
+        task.deletes()
+            .forEach(
+                deletionVector ->
+                    assertEquals(replace.sequenceNumber(), deletionVector.dataSequenceNumber()));
+      }
+    } catch (java.io.IOException e) {
+      throw new AssertionError(e);
+    }
+  }
+
+  @Test
+  void aDiffIcebergCannotExpressAsARewriteIsLeftToTheCaller() {
+    Table table = newTable(3);
+    InternalDataFile a = dataFile(table, "a");
+    InternalDataFile b = dataFile(table, "b");
+    InternalDataFile c = dataFile(table, "c");
+    InternalDataFile unknown = dataFile(table, "unknown");
+    apply(table, Arrays.asList(a, b), Collections.emptyList(), Collections.emptyMap(), false);
+    long snapshot = table.currentSnapshot().snapshotId();
+
+    Map<String, List<Long>> none = Collections.emptyMap();
+    List<InternalDataFile> addsC = Arrays.asList(c);
+    assertNull(rewrite(table, addsC, Collections.emptyList(), none, null), "removes nothing");
+    assertNull(rewrite(table, addsC, Arrays.asList(unknown), none, null), "removes a missing file");
+    assertNull(
+        rewrite(table, addsC, Arrays.asList(a), positions(b, 1L), null),
+        "deletes rows of a file it does not add");
+    assertNull(
+        rewrite(table, addsC, Arrays.asList(a), positions(c, 1L), null),
+        "adds a deletion vector without removing one");
+    Predicate<String> unknownHoldsNoLiveRows = unknown.getPhysicalPath()::equals;
+    assertNull(
+        rewrite(table, addsC, Arrays.asList(unknown), none, unknownHoldsNoLiveRows),
+        "removes only a file the table does not hold");
+    assertEquals(snapshot, table.currentSnapshot().snapshotId());
+
+    assertEquals(
+        Collections.emptySet(),
+        rewrite(table, addsC, Arrays.asList(a, unknown), none, unknownHoldsNoLiveRows));
+    assertEquals(DataOperations.REPLACE, table.currentSnapshot().operation());
+    assertEquals(expected("b", Arrays.asList(), "c", Arrays.asList()), deletedPositions(table));
+  }
+
   @Test
   void positionsOfAFileThatIsNotLiveFailTheCommit() {
     Table table = newTable(3);
