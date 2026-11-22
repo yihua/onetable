@@ -166,6 +166,7 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
           .put("testSkewDelete", WRITE_DISTRIBUTION)
           .put("testCoalesceUpdate", WRITE_DISTRIBUTION)
           .put("testSkewUpdate", WRITE_DISTRIBUTION)
+          .put("testSkewMerge", WRITE_DISTRIBUTION)
           .put(
               "testMergeConditionSplitIntoTargetPredicateAndJoinCondition",
               "not applicable: asserts the join type and target filter of Iceberg's MERGE rewrite"
@@ -179,6 +180,7 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
           .put("testDeleteToWapBranchCanDeleteWhereScansWapBranch", WAP_BRANCH)
           .put("testMetadataDeleteToWapBranchCommitsToWapBranch", WAP_BRANCH)
           .put("testUpdateToWAPBranch", WAP_BRANCH)
+          .put("testMergeToWapBranch", WAP_BRANCH)
           .put(
               "testDeleteWithPartitionedTable",
               "not applicable: reads the Iceberg metadata table <table>.partitions through the"
@@ -201,6 +203,18 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
           .put("testUpdateWithAlias", PARTITION_EVOLUTION)
           .put("testUpdateWithUserDefinedDistribution", PARTITION_EVOLUTION)
           .build();
+
+  private static final String MERGE_ON_READ_ROW_READS =
+      "product gap: Hudi reads a merge-on-read table row by row, since its file group reader"
+          + " merges the log records into the rows of the base file; the scan never returns"
+          + " columnar batches (HoodieFileGroupReaderBasedFileFormat.supportBatch). Size: large, a"
+          + " columnar merge in the file group reader";
+
+  /** Cases skipped as {@link #SKIPPED_CASES} are, only in the merge-on-read suites. */
+  private static final Map<String, String> MERGE_ON_READ_SKIPPED_CASES =
+      ImmutableMap.of(
+          "testDeleteWithVectorizedReads", MERGE_ON_READ_ROW_READS,
+          "testUpdateWithVectorizedReads", MERGE_ON_READ_ROW_READS);
   private static final Pattern CREATE_ICEBERG_TABLE =
       Pattern.compile("(?is)^\\s*CREATE\\s+TABLE\\s+(\\S+)\\s*\\((.*)\\)\\s*USING\\s+iceberg\\b(.*)$");
   private static final Pattern TBLPROPERTIES = Pattern.compile("(?i)TBLPROPERTIES\\s*\\(");
@@ -333,6 +347,9 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
     String skipReason = testInfo.getTestMethod().map(m -> SKIPPED_CASES.get(m.getName())).orElse(null);
     Assumptions.assumeTrue(skipReason == null, skipReason);
     if (isMergeOnRead()) {
+      String morSkipReason =
+          testInfo.getTestMethod().map(m -> MERGE_ON_READ_SKIPPED_CASES.get(m.getName())).orElse(null);
+      Assumptions.assumeTrue(morSkipReason == null, morSkipReason);
       Assumptions.assumeTrue(
           formatVersion >= 3,
           "the pluggable table format publishes merge-on-read only at format version 3");
