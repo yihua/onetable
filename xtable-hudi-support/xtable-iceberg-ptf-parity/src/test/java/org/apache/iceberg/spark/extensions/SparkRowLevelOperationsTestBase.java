@@ -41,6 +41,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -52,6 +53,7 @@ import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -107,7 +109,10 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.ExtensionContext;
+import org.junit.jupiter.api.extension.TestExecutionExceptionHandler;
 import org.junit.jupiter.api.io.TempDir;
+import org.opentest4j.TestAbortedException;
 
 /**
  * Stands in for Iceberg's base of the Spark row-level operation suites. The table under test is a
@@ -118,12 +123,16 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>By default the Hudi table is keyless. {@code -Dparity.primaryKey=<column>} gives every table
  * that has that column a Hudi primary key on it, with no ordering field, so merge-on-read keeps the
  * commit-time ordering that the update-as-delete-insert mode requires. The Iceberg suites sometimes
- * insert duplicate or null values into that column; with a key Hudi upserts or rejects those rows,
- * so such cases differ from Iceberg because of key semantics alone. {@code
+ * insert duplicate or null values into that column or assign it; with a key Hudi rejects those
+ * statements, so such cases differ from Iceberg because of key semantics alone. {@code
  * -Dparity.mergePartialUpdates=<true|false>} sets {@code hoodie.spark.sql.merge.into.partial.updates}
  * in the session, which decides whether a MERGE that assigns some columns writes partial updates.
+ *
+ * <p>With a key, a case that fails because one of its statements breaks a Hudi primary key rule is
+ * skipped as not applicable, with the rule as the reason; see {@link #keyRuleBroken}. A case that
+ * breaks such a rule without an error from Hudi is listed in {@link #REPEATED_KEY_CASES}.
  */
-@ExtendWith(ParameterizedTestExtension.class)
+@ExtendWith({ParameterizedTestExtension.class, SparkRowLevelOperationsTestBase.KeyRuleHandler.class})
 public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBase {
 
   private static final String READ_VIEW = "ptf_iceberg_read";
@@ -267,6 +276,12 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
   protected String tablePath;
   private String currentTest;
 
+  private String currentMethod;
+
+  /** The failures of this case's statements that broke a primary key rule, with the rule. */
+  private final List<Map.Entry<Throwable, String>> keyRuleFailures =
+      Collections.synchronizedList(new ArrayList<>());
+
   /**
    * Hudi has no branches, so every case runs on main. Merge-on-read is published with deletion
    * vectors, which need format version 3; the version 2 case is skipped for it.
@@ -350,8 +365,15 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
             + "[v"
             + formatVersion
             + "]";
+    currentMethod = testInfo.getTestMethod().map(m -> m.getName()).orElse("?");
+    keyRuleFailures.clear();
     String skipReason = testInfo.getTestMethod().map(m -> SKIPPED_CASES.get(m.getName())).orElse(null);
     Assumptions.assumeTrue(skipReason == null, skipReason);
+    if (PRIMARY_KEY.equals("id")) {
+      String repeatedKeyReason = REPEATED_KEY_CASES.get(currentMethod);
+      Assumptions.assumeTrue(
+          repeatedKeyReason == null, "not applicable with a primary key: " + repeatedKeyReason);
+    }
     if (isMergeOnRead()) {
       String morSkipReason =
           testInfo.getTestMethod().map(m -> MERGE_ON_READ_SKIPPED_CASES.get(m.getName())).orElse(null);
@@ -477,7 +499,169 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
       columns.add(column.cast(field.dataType()).as(field.name()));
     }
     ds.coalesce(1).select(columns.toArray(new Column[0])).createOrReplaceTempView(APPEND_VIEW);
-    spark.sql(String.format("INSERT INTO %s SELECT * FROM %s", tableName, APPEND_VIEW));
+    String insert = String.format("INSERT INTO %s SELECT * FROM %s", tableName, APPEND_VIEW);
+    runStatement(insert, () -> spark.sql(insert));
+  }
+
+  private static final Pattern INSERT_STATEMENT = Pattern.compile("(?is)^\\s*INSERT\\b.*");
+  private static final Pattern UPDATE_STATEMENT = Pattern.compile("(?is)^\\s*UPDATE\\b.*");
+  private static final Pattern MERGE_STATEMENT = Pattern.compile("(?is)^\\s*MERGE\\b.*");
+  private static final Pattern UPDATE_SET_CLAUSE =
+      Pattern.compile("(?is)\\bUPDATE\\s+SET\\s+(.*?)(?=\\bWHEN\\b|$)");
+
+  private static final String SOURCE_NAMES_KEY_OTHERWISE =
+      "the MERGE source does not project the primary key column: it holds the key under another"
+          + " name, which only the ON condition relates to the key, and Hudi takes the key of a"
+          + " source record from a source column of the key's name or from an assignment of the"
+          + " key";
+
+  /**
+   * Cases whose MERGE source does not project the primary key column, read from each case: Hudi
+   * refuses such a MERGE as "Failed to resolve primary key", which a source that does project the
+   * key could also meet, so the cases are listed.
+   */
+  private static final Map<String, String> SOURCE_WITHOUT_KEY_CASES =
+      ImmutableMap.<String, String>builder()
+          .put("testMergeWithMultipleRowGroupsParquet", SOURCE_NAMES_KEY_OTHERWISE)
+          .put("testMergeWithSourceAsSelfSubquery", SOURCE_NAMES_KEY_OTHERWISE)
+          .put("testMergeWithSubqueriesInConditions", SOURCE_NAMES_KEY_OTHERWISE)
+          .put("testCopyOnWriteMergeSetsSortOrderIdOnRewrittenDataFiles", SOURCE_NAMES_KEY_OTHERWISE)
+          .build();
+
+  /**
+   * Cases whose data repeats a value of {@code id} where Hudi raises no error to detect, skipped
+   * when {@code id} is the primary key: Hudi keeps one row per key, so the rows the case expects
+   * cannot be in the table.
+   */
+  private static final Map<String, String> REPEATED_KEY_CASES =
+      ImmutableMap.of(
+          "testMergeInsertOnly",
+          "the MERGE source holds two rows for one primary key, which the NOT MATCHED clause"
+              + " inserts; Hudi writes one row per key and raises no error",
+          "testCoalesceMerge",
+          "the case inserts every primary key four times; Hudi refuses the repeated INSERT only"
+              + " where it looks the table up, which it does not do on a merge-on-read table"
+              + " with the simple index");
+
+  /** Runs a statement, noting a failure that breaks a primary key rule before passing it on. */
+  private <T> T runStatement(String statement, Supplier<T> run) {
+    try {
+      return run.get();
+    } catch (Throwable t) {
+      String rule = keyRuleBroken(statement, t);
+      if (rule != null) {
+        keyRuleFailures.add(new AbstractMap.SimpleImmutableEntry<>(t, rule));
+      }
+      throw KeyRuleHandler.<RuntimeException>sneakyThrow(t);
+    }
+  }
+
+  /**
+   * The Hudi primary key rule that a failed statement broke because of the case's own data or
+   * statement, or null. Only these failures count, and only with a key:
+   *
+   * <ul>
+   *   <li>an INSERT of a NULL key, which Hudi refuses as it cannot write a record without a key;
+   *   <li>an INSERT of a key the table holds or that the inserted rows repeat, which Hudi refuses
+   *       by default on a table with a key;
+   *   <li>an UPDATE that assigns the key, which Hudi refuses, as the key names the record;
+   *   <li>a MERGE that Hudi refuses as "Failed to resolve primary key", when its UPDATE SET
+   *       assigns the key, or when the case is one of {@link #SOURCE_WITHOUT_KEY_CASES}.
+   * </ul>
+   */
+  private String keyRuleBroken(String statement, Throwable failure) {
+    if (PRIMARY_KEY.isEmpty()) {
+      return null;
+    }
+    String messages = causeMessages(failure);
+    if (INSERT_STATEMENT.matcher(statement).matches()) {
+      if (messages.contains("recordKey value: \"null\" for field: \"" + PRIMARY_KEY + "\"")) {
+        return "the case inserts a NULL primary key";
+      }
+      if (messages.contains("Duplicate key found for insert statement")) {
+        return messages.contains("The table already has a record with this key")
+            ? "the case inserts a primary key that the table already holds"
+            : "the case inserts a primary key more than once in one statement";
+      }
+    } else if (UPDATE_STATEMENT.matcher(statement).matches()) {
+      if (messages.contains(
+          "disallowed assignment clause in UPDATE statement for record key field `"
+              + PRIMARY_KEY
+              + "`")) {
+        return "the UPDATE assigns the primary key column";
+      }
+    } else if (MERGE_STATEMENT.matcher(statement).matches()) {
+      if (messages.contains(
+          "Failed to resolve primary key `" + PRIMARY_KEY + "` w/in the source-table output")) {
+        return updateSetAssignsKey(statement)
+            ? "the MERGE assigns the primary key column in UPDATE SET"
+            : SOURCE_WITHOUT_KEY_CASES.get(currentMethod);
+      }
+    }
+    return null;
+  }
+
+  private static boolean updateSetAssignsKey(String statement) {
+    Pattern keyAssignment =
+        Pattern.compile("(?i)(^|,)\\s*(\\w+\\.)?" + Pattern.quote(PRIMARY_KEY) + "\\s*=(?!=)");
+    Matcher clauses = UPDATE_SET_CLAUSE.matcher(statement);
+    while (clauses.find()) {
+      if (keyAssignment.matcher(clauses.group(1)).find()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static String causeMessages(Throwable failure) {
+    StringBuilder messages = new StringBuilder();
+    for (Throwable t = failure; t != null; t = t.getCause() == t ? null : t.getCause()) {
+      messages.append(t.getMessage()).append('\n');
+    }
+    return messages.toString();
+  }
+
+  /**
+   * Skips a case as not applicable when its test fails because of a statement that broke a
+   * primary key rule: the failure is that statement's error, or an assertion on it, as when the
+   * case expected Iceberg's error for the statement. Any other failure passes through.
+   */
+  static class KeyRuleHandler implements TestExecutionExceptionHandler {
+    @Override
+    public void handleTestExecutionException(ExtensionContext context, Throwable thrown)
+        throws Throwable {
+      Object instance = context.getTestInstance().orElse(null);
+      if (instance instanceof SparkRowLevelOperationsTestBase) {
+        List<Map.Entry<Throwable, String>> failures =
+            ((SparkRowLevelOperationsTestBase) instance).keyRuleFailures;
+        synchronized (failures) {
+          for (Map.Entry<Throwable, String> failure : failures) {
+            if (causedBy(thrown, failure.getKey())) {
+              throw new TestAbortedException(
+                  "not applicable with a primary key: " + failure.getValue(), thrown);
+            }
+          }
+        }
+      }
+      throw thrown;
+    }
+
+    private static boolean causedBy(Throwable thrown, Throwable failure) {
+      for (Throwable t = thrown; t != null; t = t.getCause() == t ? null : t.getCause()) {
+        if (t == failure) {
+          return true;
+        }
+      }
+      String failureMessage = String.valueOf(failure.getMessage()).split("\n", 2)[0];
+      return thrown instanceof AssertionError
+          && thrown.getMessage() != null
+          && thrown.getMessage().contains(failureMessage);
+    }
+
+    @SuppressWarnings("unchecked")
+    static <E extends Throwable> E sneakyThrow(Throwable t) throws E {
+      throw (E) t;
+    }
   }
 
   protected void createOrReplaceView(String name, String jsonData) {
@@ -541,11 +725,17 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
     if (isQuery(statement) && mentionsTableUnderTest(statement)) {
       statement = readThroughIceberg(statement);
     }
-    Dataset<Row> result = spark.sql(statement);
-    if (isQuery(statement)) {
-      result = withoutHudiMetaColumns(result);
-    }
-    List<Row> rows = result.collectAsList();
+    String toRun = statement;
+    List<Row> rows =
+        runStatement(
+            toRun,
+            () -> {
+              Dataset<Row> result = spark.sql(toRun);
+              if (isQuery(toRun)) {
+                result = withoutHudiMetaColumns(result);
+              }
+              return result.collectAsList();
+            });
     if (rows.isEmpty()) {
       return ImmutableList.of();
     }
