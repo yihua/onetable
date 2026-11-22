@@ -34,11 +34,13 @@ import org.apache.hudi.avro.model.HoodieCompactionOperation;
 import org.apache.hudi.avro.model.HoodieRollbackMetadata;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.DeleteRecord;
+import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieDeltaWriteStat;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.HoodieLogFile;
+import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
@@ -263,6 +265,60 @@ class HudiPositionalDeleteExtractor {
                                     slice.getBaseFile().get(),
                                     slice.getLogFiles().collect(Collectors.toList())))));
     return positionsByBaseFile;
+  }
+
+  /**
+   * Whether no row of the base file at the given path is live: the file holds no rows, or the log
+   * files of its file slice delete every one of them. A delete that leaves no row of a base file
+   * removes the file from Iceberg, while Hudi keeps it until a compaction, a clustering or a clean
+   * replaces it, so later instants can still name it.
+   *
+   * @return false also when the file is gone or is not the base file of its file group's latest
+   *     merged file slice
+   */
+  boolean holdsNoLiveRows(String path) {
+    StoragePath baseFilePath = new StoragePath(path);
+    try {
+      if (!metaClient.getStorage().exists(baseFilePath)) {
+        return false;
+      }
+    } catch (IOException e) {
+      throw new ReadException("Unable to look up base file " + path, e);
+    }
+    long rows =
+        HoodieIOFactory.getIOFactory(metaClient.getStorage())
+            .getFileFormatUtils(baseFilePath)
+            .getRowCount(metaClient.getStorage(), baseFilePath);
+    if (rows == 0) {
+      return true;
+    }
+    if (metaClient.getTableType() != HoodieTableType.MERGE_ON_READ) {
+      return false;
+    }
+    Option<HoodieInstant> lastInstant = metaClient.getActiveTimeline().lastInstant();
+    if (!lastInstant.isPresent()) {
+      return false;
+    }
+    Option<FileSlice> slice =
+        fsView()
+            .getLatestMergedFileSliceBeforeOrOn(
+                FSUtils.getRelativePartitionPath(
+                    metaClient.getBasePath(), baseFilePath.getParent()),
+                lastInstant.get().requestedTime(),
+                FSUtils.getFileIdFromFilePath(baseFilePath));
+    if (!slice.isPresent()
+        || !slice.get().getBaseFile().isPresent()
+        || !slice.get().getBaseFile().get().getFileName().equals(baseFilePath.getName())) {
+      return false;
+    }
+    long deleted =
+        positionsDeletedFrom(
+                slice.get().getBaseFile().get(),
+                slice.get().getLogFiles().collect(Collectors.toList()))
+            .stream()
+            .filter(position -> position >= 0 && position < rows)
+            .count();
+    return deleted == rows;
   }
 
   private Map<HoodieFileGroupId, Set<StoragePath>> logFilesByFileGroup(

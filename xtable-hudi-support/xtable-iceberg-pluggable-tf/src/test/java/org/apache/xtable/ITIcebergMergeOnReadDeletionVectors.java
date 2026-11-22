@@ -29,7 +29,10 @@ import static org.apache.xtable.MergeOnReadAssertions.deletionVectorFiles;
 import static org.apache.xtable.MergeOnReadAssertions.deletionVectorTable;
 import static org.apache.xtable.MergeOnReadAssertions.filesWithDeletes;
 import static org.apache.xtable.MergeOnReadAssertions.icebergRows;
+import static org.apache.xtable.MergeOnReadAssertions.rowCount;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -65,8 +68,12 @@ import org.apache.hudi.common.model.HoodieAvroPayload;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.storage.StoragePath;
 
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.DataOperations;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotSummary;
 
 /**
  * A merge-on-read table whose writer turns every update into a positional delete plus an insert is
@@ -262,6 +269,115 @@ class ITIcebergMergeOnReadDeletionVectors {
       assertIcebergMatchesHudi(spark, basePath);
       assertEquals(10, deletedRowCount(deletedKeysByDataFileInIceberg(spark, basePath)));
     }
+  }
+
+  /**
+   * A delete of every row of a base file removes the data file in a delete snapshot, as Iceberg's
+   * own writer does, instead of giving it a deletion vector of all its rows. Hudi keeps the base
+   * file until a compaction or a clustering replaces it, and the instants that name it later leave
+   * Iceberg holding the base files with live rows: a rollback of the delete, an upsert of the
+   * deleted keys and its rollback, a clustering, a compaction and a clean.
+   */
+  @ParameterizedTest
+  @ValueSource(ints = {9, 10})
+  void deleteOfEveryRowOfABaseFileRemovesTheDataFile(int tableVersion) {
+    try (TestJavaHudiTable table = newTable(null, deletionVectorTable(tableVersion))) {
+      String basePath = table.getBasePath();
+      List<HoodieRecord<HoodieAvroPayload>> inserts = table.insertRecords(40, true);
+      String baseFile = localPaths(table.getAllLatestBaseFilePaths()).get(0);
+      table.insertRecords(20, true);
+      Set<String> keysOfBaseFile =
+          spark
+              .read()
+              .parquet(baseFile)
+              .select(HoodieRecord.RECORD_KEY_METADATA_FIELD)
+              .collectAsList()
+              .stream()
+              .map(row -> row.getString(0))
+              .collect(Collectors.toSet());
+      List<HoodieRecord<HoodieAvroPayload>> deleted =
+          inserts.stream()
+              .filter(record -> keysOfBaseFile.contains(record.getRecordKey()))
+              .collect(Collectors.toList());
+      assertEquals(40, deleted.size(), "rows of the first base file");
+      int rowsLeft = 20;
+
+      table.deleteRecords(deleted.subList(0, 2), true);
+      assertIcebergMatchesHudi(spark, basePath);
+      table.deleteRecords(deleted.subList(2, deleted.size()), true);
+      String delete = latestInstant(table);
+      Snapshot snapshot = icebergTable(basePath).currentSnapshot();
+      assertEquals(DataOperations.DELETE, snapshot.operation());
+      assertEquals("1", snapshot.summary().get(SnapshotSummary.DELETED_FILES_PROP));
+      assertEquals("1", snapshot.summary().get(SnapshotSummary.REMOVED_DVS_PROP));
+      assertNull(snapshot.summary().get(SnapshotSummary.ADDED_DVS_PROP));
+      assertEquals(
+          String.valueOf(rowsLeft), snapshot.summary().get(SnapshotSummary.TOTAL_RECORDS_PROP));
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
+      assertFalse(deletedKeysByDataFileInIceberg(spark, basePath).containsKey(baseFile));
+
+      // The rollback restores the data file with the deletion vector of the first delete.
+      table.rollback(delete);
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft + deleted.size() - 2);
+      assertEquals(2, deletedKeysByDataFileInIceberg(spark, basePath).get(baseFile).size());
+      table.deleteRecords(deleted.subList(2, deleted.size()), true);
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
+
+      // The index still finds the deleted keys in the base file, so the upsert deletes them from
+      // it again and inserts them into another file group.
+      table.upsertRecords(deleted, true);
+      String upsert = latestInstant(table);
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, 60);
+      table.rollback(upsert);
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
+
+      table.cluster();
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
+
+      // The compaction of a base file whose rows a delete removed in full.
+      List<String> beforeInsert = localPaths(table.getAllLatestBaseFilePaths());
+      List<HoodieRecord<HoodieAvroPayload>> inserted = table.insertRecords(10, true);
+      List<String> insertedBaseFiles = localPaths(table.getAllLatestBaseFilePaths());
+      insertedBaseFiles.removeAll(beforeInsert);
+      assertEquals(1, insertedBaseFiles.size());
+      table.deleteRecords(inserted, true);
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
+      assertFalse(
+          deletedKeysByDataFileInIceberg(spark, basePath).containsKey(insertedBaseFiles.get(0)));
+      table.compact();
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
+
+      table.upsertRecords(deleted, true);
+      table.clean();
+      assertIcebergHoldsTheBaseFilesWithLiveRows(table, 60);
+      assertNothingPending(reconstructedTimeline(basePath));
+    }
+  }
+
+  /**
+   * Iceberg reads the rows Hudi reads, holds the base files of Hudi's latest file slices with a
+   * live row, and has no data file with rows whose deletion vector deletes them all.
+   */
+  private static void assertIcebergHoldsTheBaseFilesWithLiveRows(
+      TestJavaHudiTable table, int rows) {
+    String basePath = table.getBasePath();
+    assertIcebergMatchesHudi(spark, basePath);
+    Map<String, Set<String>> deletedKeys = deletedKeysByDataFileInIceberg(spark, basePath);
+    deletedKeys.forEach(
+        (file, keys) ->
+            assertTrue(
+                rowCount(file) == 0 || keys.size() < rowCount(file),
+                "every row of data file " + file + " is deleted"));
+    assertTrue(
+        localPaths(table.getAllLatestBaseFilePaths()).containsAll(deletedKeys.keySet()),
+        "Iceberg holds a file that is not a latest Hudi base file: " + deletedKeys.keySet());
+    assertEquals(rows, icebergRows(spark, basePath).size());
+  }
+
+  private static List<String> localPaths(List<String> paths) {
+    return paths.stream()
+        .map(path -> new StoragePath(path).toUri().getPath())
+        .collect(Collectors.toList());
   }
 
   @Test

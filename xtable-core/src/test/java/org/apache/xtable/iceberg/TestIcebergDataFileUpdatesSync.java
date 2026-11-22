@@ -125,6 +125,7 @@ class TestIcebergDataFileUpdatesSync {
         Collections.emptyList(),
         false,
         deleteOperation,
+        null,
         transaction.table().schema(),
         transaction.table().spec(),
         metadata);
