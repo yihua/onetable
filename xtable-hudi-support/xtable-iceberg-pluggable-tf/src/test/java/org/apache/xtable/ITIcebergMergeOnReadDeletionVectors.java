@@ -19,6 +19,7 @@
 package org.apache.xtable;
 
 import static org.apache.xtable.IcebergTableAssertions.assertNothingPending;
+import static org.apache.xtable.IcebergTableAssertions.assertPublishedAsARewrite;
 import static org.apache.xtable.IcebergTableAssertions.icebergTable;
 import static org.apache.xtable.IcebergTableAssertions.reconstructedTimeline;
 import static org.apache.xtable.MergeOnReadAssertions.UPDATES_AS_DELETES_AND_INSERTS;
@@ -146,6 +147,7 @@ class ITIcebergMergeOnReadDeletionVectors {
       assertEquals(45, icebergRows(spark, basePath).size());
 
       table.compact();
+      assertPublishedAsARewrite(basePath);
       assertIcebergMatchesHudi(spark, basePath);
       assertEquals(0, deletedRowCount(deletedKeysByDataFileInIceberg(spark, basePath)));
       assertEquals(45, icebergRows(spark, basePath).size());
@@ -332,6 +334,7 @@ class ITIcebergMergeOnReadDeletionVectors {
       assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
 
       table.cluster();
+      assertPublishedAsARewrite(basePath);
       assertIcebergHoldsTheBaseFilesWithLiveRows(table, rowsLeft);
 
       // The compaction of a base file whose rows a delete removed in full.

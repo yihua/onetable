@@ -20,11 +20,13 @@ package org.apache.xtable;
 
 import static org.apache.hudi.hadoop.fs.HadoopFSUtils.getStorageConf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
@@ -43,7 +45,10 @@ import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.core.io.storage.HoodieIOFactory;
 import org.apache.hudi.storage.StoragePath;
 
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
@@ -53,6 +58,23 @@ import org.apache.iceberg.io.CloseableIterable;
 /** Helpers shared by the integration tests that compare the Iceberg table against Hudi. */
 final class IcebergTableAssertions {
   private IcebergTableAssertions() {}
+
+  /**
+   * The current snapshot is a replace whose data files keep the data sequence number of the
+   * snapshot before it, as Iceberg's own rewrite of data files publishes a compaction.
+   */
+  static void assertPublishedAsARewrite(String basePath) {
+    Table table = icebergTable(basePath);
+    Snapshot snapshot = table.currentSnapshot();
+    assertEquals(DataOperations.REPLACE, snapshot.operation());
+    long startingSequenceNumber = table.snapshot(snapshot.parentId()).sequenceNumber();
+    List<DataFile> added = new ArrayList<>();
+    snapshot.addedDataFiles(table.io()).forEach(added::add);
+    assertFalse(added.isEmpty(), "the rewrite added no data file");
+    for (DataFile file : added) {
+      assertEquals(startingSequenceNumber, file.dataSequenceNumber(), file.location());
+    }
+  }
 
   static Table icebergTable(String basePath) {
     return new HadoopTables(new Configuration()).load(basePath);

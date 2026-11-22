@@ -19,6 +19,7 @@
 package org.apache.xtable;
 
 import static org.apache.xtable.IcebergTableAssertions.assertNothingPending;
+import static org.apache.xtable.IcebergTableAssertions.assertPublishedAsARewrite;
 import static org.apache.xtable.IcebergTableAssertions.icebergTable;
 import static org.apache.xtable.IcebergTableAssertions.reconstructedTimeline;
 import static org.apache.xtable.MergeOnReadAssertions.assertIcebergMatchesHudi;
@@ -109,6 +110,7 @@ class ITIcebergMorDvTableServices {
       assertEquals(15, deletedRowCount(deletedKeysByDataFileInIceberg(spark, basePath)));
 
       table.cluster();
+      assertPublishedAsARewrite(basePath);
       assertIcebergMatchesHudi(spark, basePath);
       assertEquals(0, deletedRowCount(deletedKeysByDataFileInIceberg(spark, basePath)));
       assertEquals(75, icebergRows(spark, basePath).size());
