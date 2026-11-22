@@ -141,6 +141,12 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
   /** The column that becomes the Hudi primary key of a created table that has it; empty for none. */
   private static final String PRIMARY_KEY = System.getProperty("parity.primaryKey", "").trim();
 
+  /**
+   * {@code hoodie.index.type} of the session and of a merge-on-read table in the update-as-delete-insert
+   * mode; {@code RECORD_INDEX} also enables the global record level index in the metadata table.
+   */
+  private static final String INDEX_TYPE = System.getProperty("parity.indexType", "SIMPLE").trim();
+
   /** {@code hoodie.spark.sql.merge.into.partial.updates} for the session, when given. */
   private static final String MERGE_PARTIAL_UPDATES = System.getProperty("parity.mergePartialUpdates");
   private static final String APPEND_VIEW = "ptf_append_source";
@@ -358,7 +364,8 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
     tablePath = new File(warehouse, "table_" + UUID.randomUUID()).toURI().toString();
     validationCatalog = new PathCatalog();
     spark.conf().set("hoodie.write.updates.as.deletes.and.inserts", String.valueOf(isMergeOnRead() && UPDATES_AS_DELETES));
-    spark.conf().set("hoodie.index.type", "SIMPLE");
+    spark.conf().set("hoodie.index.type", INDEX_TYPE);
+    spark.conf().set("hoodie.metadata.global.record.level.index.enable", String.valueOf(INDEX_TYPE.equals("RECORD_INDEX")));
     if (MERGE_PARTIAL_UPDATES != null) {
       spark.conf().set("hoodie.spark.sql.merge.into.partial.updates", MERGE_PARTIAL_UPDATES);
     }
@@ -670,7 +677,10 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
     }
     if (isMergeOnRead() && UPDATES_AS_DELETES) {
       properties.put("hoodie.write.updates.as.deletes.and.inserts", "true");
-      properties.put("hoodie.index.type", "SIMPLE");
+      properties.put("hoodie.index.type", INDEX_TYPE);
+      if (INDEX_TYPE.equals("RECORD_INDEX")) {
+        properties.put("hoodie.metadata.global.record.level.index.enable", "true");
+      }
     }
     String hudiProperties = tablePropsAsString(properties);
     String clauses = matcher.group(3);
