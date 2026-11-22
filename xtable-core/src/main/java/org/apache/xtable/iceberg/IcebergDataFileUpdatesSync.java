@@ -24,10 +24,13 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
@@ -178,6 +181,13 @@ public class IcebergDataFileUpdatesSync {
    * a deletion vector whose data file is neither live nor added by this commit. Iceberg drops the
    * deletion vector of every data file the diff removes.
    *
+   * <p>A delete that leaves no row of a live data file removes the file instead of giving it a
+   * deletion vector of all its rows, as Iceberg's own writer does for a delete that matches whole
+   * files; when it only removes files it is committed as an Iceberg delete of them. Such a file is
+   * no longer in the table while the source still has it, so a later diff that removes it or
+   * deletes its rows again leaves it out, provided {@code withoutLiveRows} confirms that it holds
+   * no live rows; any other file the table does not hold still fails the commit.
+   *
    * @param deletedPositionsByDataFile row positions deleted from data files, keyed by the path the
    *     data file is recorded under
    * @param partitionsOfDataFiles the partitions holding those data files; the lookup of their
@@ -186,6 +196,8 @@ public class IcebergDataFileUpdatesSync {
    *     replace its current deletion vector, an empty collection leaving the file without one; when
    *     false they are merged into the file's current deletion vector
    * @param deleteOperation whether the source commit is a delete, see {@link #applyDiff}
+   * @param withoutLiveRows whether the source holds no live rows of the data file at a path, or
+   *     null when every file the diff references has to be in the table
    * @return the deletion vector files written for the row delta, which no snapshot references until
    *     the transaction commits; when the row delta fails they are deleted before it throws
    */
@@ -197,6 +209,7 @@ public class IcebergDataFileUpdatesSync {
       Collection<List<PartitionValue>> partitionsOfDataFiles,
       boolean replaceDeletionVectors,
       boolean deleteOperation,
+      Predicate<String> withoutLiveRows,
       Schema schema,
       PartitionSpec partitionSpec,
       TableSyncMetadata metadata) {
@@ -206,6 +219,84 @@ public class IcebergDataFileUpdatesSync {
       commitEmptyDelete(transaction, metadata);
       return Collections.emptySet();
     }
+    if (!deletedPositionsByDataFile.isEmpty()) {
+      requireDeletionVectors(table);
+    }
+    Map<String, DataFile> filesAdded =
+        dataFiles(internalFilesDiff.dataFilesAdded(), schema, partitionSpec);
+    Map<String, DataFile> filesRemoved =
+        dataFiles(internalFilesDiff.dataFilesRemoved(), schema, partitionSpec);
+    Set<String> lookedUp = new HashSet<>(deletedPositionsByDataFile.keySet());
+    Set<List<PartitionValue>> partitions = new LinkedHashSet<>(partitionsOfDataFiles);
+    if (withoutLiveRows != null) {
+      lookedUp.addAll(filesRemoved.keySet());
+      internalFilesDiff
+          .dataFilesRemoved()
+          .forEach(file -> partitions.add(file.getPartitionValues()));
+    }
+    Map<String, FileScanTask> liveFiles =
+        lookedUp.isEmpty()
+            ? Collections.emptyMap()
+            : liveFiles(
+                table,
+                lookedUp,
+                filesAdded.keySet(),
+                partitionValueConverter.partitionFilter(partitionSpec, schema, partitions));
+
+    Map<String, Collection<Long>> positionsToWrite = new LinkedHashMap<>();
+    Map<String, PositionDeleteIndex> previousPositions = new HashMap<>();
+    List<DataFile> filesDeletedWhole = new ArrayList<>();
+    for (Map.Entry<String, ? extends Collection<Long>> entry :
+        deletedPositionsByDataFile.entrySet()) {
+      String path = entry.getKey();
+      FileScanTask liveFile = liveFiles.get(path);
+      if (filesRemoved.containsKey(path) || (liveFile == null && !filesAdded.containsKey(path))) {
+        if (!filesRemoved.containsKey(path) && holdsNoLiveRows(withoutLiveRows, path)) {
+          continue;
+        }
+        throw new UpdateException(
+            "Deleted positions reference a data file that is not live in the Iceberg table: "
+                + path);
+      }
+      PositionDeleteIndex previous =
+          liveFile == null || replaceDeletionVectors
+              ? null
+              : currentDeletionVector(liveFile)
+                  .map(deletionVector -> readPositions(table, deletionVector))
+                  .orElse(null);
+      if (deleteOperation
+          && liveFile != null
+          && deletesEveryRow(liveFile.file(), previous, entry.getValue())) {
+        filesDeletedWhole.add(liveFile.file());
+        continue;
+      }
+      if (previous != null) {
+        previousPositions.put(path, previous);
+      }
+      positionsToWrite.put(path, entry.getValue());
+    }
+    if (withoutLiveRows != null) {
+      filesRemoved
+          .keySet()
+          .removeIf(path -> !liveFiles.containsKey(path) && withoutLiveRows.test(path));
+    }
+
+    if (deleteOperation && filesAdded.isEmpty() && positionsToWrite.isEmpty()) {
+      if (filesRemoved.isEmpty() && filesDeletedWhole.isEmpty()) {
+        commitEmptyDelete(transaction, metadata);
+        return Collections.emptySet();
+      }
+      if (!filesDeletedWhole.isEmpty()) {
+        // A row delta that only removes files is labelled an overwrite.
+        DeleteFiles deleteFiles = transaction.newDelete().validateFilesExist();
+        filesDeletedWhole.forEach(deleteFiles::deleteFile);
+        filesRemoved.values().forEach(deleteFiles::deleteFile);
+        deleteFiles.set(TableSyncMetadata.XTABLE_METADATA, metadata.toJson());
+        deleteFiles.commit();
+        return Collections.emptySet();
+      }
+    }
+
     RowDelta rowDelta = transaction.newRowDelta();
     Snapshot currentSnapshot = transaction.table().currentSnapshot();
     if (currentSnapshot != null) {
@@ -214,30 +305,31 @@ public class IcebergDataFileUpdatesSync {
       rowDelta.validateFromSnapshot(currentSnapshot.snapshotId());
     }
     rowDelta.validateDeletedFiles();
-    Map<String, DataFile> filesAdded = new HashMap<>();
-    for (InternalDataFile file : internalFilesDiff.dataFilesAdded()) {
-      DataFile dataFile = getDataFile(partitionSpec, schema, file);
-      filesAdded.put(dataFile.location(), dataFile);
-      rowDelta.addRows(dataFile);
-    }
-    Set<String> filesRemoved = new HashSet<>();
-    for (InternalDataFile file : internalFilesDiff.dataFilesRemoved()) {
-      DataFile dataFile = getDataFile(partitionSpec, schema, file);
-      filesRemoved.add(dataFile.location());
-      rowDelta.removeRows(dataFile);
-    }
+    filesAdded.values().forEach(rowDelta::addRows);
+    filesRemoved.values().forEach(rowDelta::removeRows);
+    filesDeletedWhole.forEach(rowDelta::removeRows);
     Set<String> deletionVectorFiles = Collections.emptySet();
-    if (!deletedPositionsByDataFile.isEmpty()) {
+    if (!positionsToWrite.isEmpty()) {
+      DeleteWriteResult written =
+          writeDeletionVectors(
+              table, positionsToWrite, liveFiles, filesAdded, previousPositions, partitionSpec);
+      List<String> liveFilesWithNewDeletionVectors = new ArrayList<>();
+      for (String path : positionsToWrite.keySet()) {
+        FileScanTask liveFile = liveFiles.get(path);
+        if (liveFile != null) {
+          liveFilesWithNewDeletionVectors.add(path);
+          if (replaceDeletionVectors) {
+            currentDeletionVector(liveFile).ifPresent(rowDelta::removeDeletes);
+          }
+        }
+      }
+      written.deleteFiles().forEach(rowDelta::addDeletes);
+      written.rewrittenDeleteFiles().forEach(rowDelta::removeDeletes);
+      rowDelta.validateDataFilesExist(liveFilesWithNewDeletionVectors);
       deletionVectorFiles =
-          addDeletionVectors(
-              table,
-              rowDelta,
-              deletedPositionsByDataFile,
-              partitionValueConverter.partitionFilter(partitionSpec, schema, partitionsOfDataFiles),
-              replaceDeletionVectors,
-              filesAdded,
-              filesRemoved,
-              partitionSpec);
+          written.deleteFiles().stream()
+              .map(DeleteFile::location)
+              .collect(Collectors.toCollection(HashSet::new));
     }
     try {
       rowDelta.set(TableSyncMetadata.XTABLE_METADATA, metadata.toJson());
@@ -247,6 +339,39 @@ public class IcebergDataFileUpdatesSync {
       throw e;
     }
     return deletionVectorFiles;
+  }
+
+  private static boolean holdsNoLiveRows(Predicate<String> withoutLiveRows, String path) {
+    return withoutLiveRows != null && withoutLiveRows.test(path);
+  }
+
+  /**
+   * Whether the positions, with those the data file's current deletion vector already deletes,
+   * cover every row of a data file that holds rows.
+   */
+  private static boolean deletesEveryRow(
+      DataFile dataFile, PositionDeleteIndex previous, Collection<Long> positions) {
+    long rows = dataFile.recordCount();
+    if (rows <= 0) {
+      return false;
+    }
+    long deleted = previous == null ? 0 : previous.cardinality();
+    for (Long position : new HashSet<>(positions)) {
+      if (position >= 0 && position < rows && (previous == null || !previous.isDeleted(position))) {
+        deleted++;
+      }
+    }
+    return deleted >= rows;
+  }
+
+  private Map<String, DataFile> dataFiles(
+      Collection<InternalDataFile> files, Schema schema, PartitionSpec partitionSpec) {
+    Map<String, DataFile> dataFiles = new LinkedHashMap<>();
+    for (InternalDataFile file : files) {
+      DataFile dataFile = getDataFile(partitionSpec, schema, file);
+      dataFiles.put(dataFile.location(), dataFile);
+    }
+    return dataFiles;
   }
 
   /**
@@ -266,16 +391,7 @@ public class IcebergDataFileUpdatesSync {
     }
   }
 
-  /** @return the deletion vector files written */
-  private Set<String> addDeletionVectors(
-      Table table,
-      RowDelta rowDelta,
-      Map<String, ? extends Collection<Long>> deletedPositionsByDataFile,
-      Expression partitionFilter,
-      boolean replaceDeletionVectors,
-      Map<String, DataFile> filesAdded,
-      Set<String> filesRemoved,
-      PartitionSpec partitionSpec) {
+  private static void requireDeletionVectors(Table table) {
     int formatVersion = ((HasTableOperations) table).operations().current().formatVersion();
     if (formatVersion < 3) {
       throw new NotSupportedException(
@@ -284,50 +400,42 @@ public class IcebergDataFileUpdatesSync {
                   + " %d",
               table.name(), formatVersion));
     }
-    Map<String, FileScanTask> liveFiles =
-        liveFiles(table, deletedPositionsByDataFile.keySet(), filesAdded.keySet(), partitionFilter);
-    List<String> liveFilesWithNewDeletionVectors = new ArrayList<>();
+  }
+
+  /**
+   * Writes one deletion vector per data file into a new file, merging each with the positions the
+   * data file's current deletion vector deletes, when given.
+   *
+   * @param previousPositions the positions the current deletion vector of a data file deletes, by
+   *     path; a file without an entry gets a deletion vector of the given positions only
+   */
+  private DeleteWriteResult writeDeletionVectors(
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByDataFile,
+      Map<String, FileScanTask> liveFiles,
+      Map<String, DataFile> filesAdded,
+      Map<String, PositionDeleteIndex> previousPositions,
+      PartitionSpec partitionSpec) {
     OutputFile deletionVectorFile =
         OutputFileFactory.builderFor(table, 1, 1)
             .format(FileFormat.PUFFIN)
             .build()
             .newOutputFile()
             .encryptingOutputFile();
-    DeleteWriteResult written;
     try (DVFileWriter writer =
-        new BaseDVFileWriter(
-            () -> deletionVectorFile,
-            path ->
-                replaceDeletionVectors
-                    ? null
-                    : currentDeletionVector(liveFiles.get(path))
-                        .map(deletionVector -> readPositions(table, deletionVector))
-                        .orElse(null))) {
-      for (Map.Entry<String, ? extends Collection<Long>> entry :
-          deletedPositionsByDataFile.entrySet()) {
+        new BaseDVFileWriter(() -> deletionVectorFile, previousPositions::get)) {
+      for (Map.Entry<String, ? extends Collection<Long>> entry : positionsByDataFile.entrySet()) {
         String path = entry.getKey();
         FileScanTask liveFile = liveFiles.get(path);
-        DataFile addedFile = filesAdded.get(path);
-        if (filesRemoved.contains(path) || (liveFile == null && addedFile == null)) {
-          throw new UpdateException(
-              "Deleted positions reference a data file that is not live in the Iceberg table: "
-                  + path);
-        }
-        if (liveFile != null) {
-          liveFilesWithNewDeletionVectors.add(path);
-          if (replaceDeletionVectors) {
-            currentDeletionVector(liveFile).ifPresent(rowDelta::removeDeletes);
-          }
-        }
         PartitionSpec spec = liveFile != null ? liveFile.spec() : partitionSpec;
         StructLike partition =
-            liveFile != null ? liveFile.file().partition() : addedFile.partition();
+            liveFile != null ? liveFile.file().partition() : filesAdded.get(path).partition();
         for (Long position : entry.getValue()) {
           writer.delete(path, position, spec, partition);
         }
       }
       writer.close();
-      written = writer.result();
+      return writer.result();
     } catch (IOException e) {
       deleteUncommittedFiles(table.io(), Collections.singleton(deletionVectorFile.location()));
       throw new UpdateException("Failed to write Iceberg deletion vectors", e);
@@ -336,12 +444,6 @@ public class IcebergDataFileUpdatesSync {
       deleteUncommittedFiles(table.io(), Collections.singleton(deletionVectorFile.location()));
       throw e;
     }
-    written.deleteFiles().forEach(rowDelta::addDeletes);
-    written.rewrittenDeleteFiles().forEach(rowDelta::removeDeletes);
-    rowDelta.validateDataFilesExist(liveFilesWithNewDeletionVectors);
-    return written.deleteFiles().stream()
-        .map(DeleteFile::location)
-        .collect(Collectors.toCollection(HashSet::new));
   }
 
   /**

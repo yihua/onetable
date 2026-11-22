@@ -34,7 +34,10 @@ import org.apache.parquet.schema.Type;
 
 import org.apache.hudi.common.BaseFileColumnResolver;
 import org.apache.hudi.common.FormatMetaColumn;
+import org.apache.hudi.common.config.HoodieCommonConfig;
+import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.engine.HoodieEngineContext;
+import org.apache.hudi.common.engine.HoodieLocalEngineContext;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
@@ -45,9 +48,10 @@ import org.apache.hudi.common.schema.HoodieSchemaField;
 import org.apache.hudi.common.schema.HoodieSchemaType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.view.FileSystemViewManager;
+import org.apache.hudi.common.table.view.FileSystemViewStorageConfig;
 import org.apache.hudi.common.util.HoodieStorageUtils;
 import org.apache.hudi.common.util.ParquetUtils;
-import org.apache.hudi.core.io.storage.HoodieIOFactory;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.storage.StorageConfiguration;
 import org.apache.hudi.storage.StoragePath;
@@ -200,8 +204,9 @@ final class IcebergRowLineage {
    * the current snapshot gives the values Iceberg readers see.
    *
    * @return null when there is no row lineage to keep: the Iceberg table is below format version 3,
-   *     or the base file holds no rows, which the table format leaves out of Iceberg
-   * @throws HoodieException when a base file that holds rows is not in the current snapshot, or
+   *     or no row of the base file is live, as it holds none or a delete removed all of them, which
+   *     the table format leaves out of Iceberg
+   * @throws HoodieException when a base file with live rows is not in the current snapshot, or
    *     Iceberg has no first row id for it
    */
   private static BaseFileLineage lookUp(HoodieTableMetaClient metaClient, HoodieBaseFile baseFile) {
@@ -234,7 +239,7 @@ final class IcebergRowLineage {
               .get(path);
     }
     if (lineage == null) {
-      if (holdsNoRows(metaClient, baseFile)) {
+      if (holdsNoLiveRows(metaClient, path)) {
         return null;
       }
       throw notInSnapshot(tableName, path, snapshot.snapshotId());
@@ -249,12 +254,20 @@ final class IcebergRowLineage {
     return lineage;
   }
 
-  private static boolean holdsNoRows(HoodieTableMetaClient metaClient, HoodieBaseFile baseFile) {
-    StoragePath path = baseFile.getStoragePath();
-    return HoodieIOFactory.getIOFactory(metaClient.getStorage())
-            .getFileFormatUtils(path)
-            .getRowCount(metaClient.getStorage(), path)
-        == 0;
+  private static boolean holdsNoLiveRows(HoodieTableMetaClient metaClient, String path) {
+    FileSystemViewManager viewManager =
+        FileSystemViewManager.createViewManagerWithTableMetadata(
+            new HoodieLocalEngineContext(metaClient.getStorageConf()),
+            HoodieMetadataConfig.newBuilder()
+                .enable(metaClient.getTableConfig().isMetadataTableAvailable())
+                .build(),
+            FileSystemViewStorageConfig.newBuilder().build(),
+            HoodieCommonConfig.newBuilder().build());
+    try {
+      return new HudiPositionalDeleteExtractor(metaClient, viewManager).holdsNoLiveRows(path);
+    } finally {
+      viewManager.close();
+    }
   }
 
   /** The Iceberg table of the Hudi table, loaded once per process and refreshed on every use. */

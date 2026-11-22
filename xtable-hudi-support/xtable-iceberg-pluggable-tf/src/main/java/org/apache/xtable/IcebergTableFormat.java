@@ -32,6 +32,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -163,12 +164,19 @@ public class IcebergTableFormat implements HoodieTableFormat {
     IncrementalTableChanges changes =
         hudiTableExtractor.extractTableChanges(commitMetadata, completedInstant);
     boolean deleteOperation = WriteOperationType.isDelete(commitMetadata.getOperationType());
-    Map<String, Set<Long>> deletedPositionsByBaseFile =
-        isMergeOnRead(metaClient.getTableConfig())
-            ? new HudiPositionalDeleteExtractor(metaClient, viewManager)
-                .positionsDeletedBy(commitMetadata, completedInstant)
-            : null;
-    completeInstant(metaClient, changes, deletedPositionsByBaseFile, false, deleteOperation);
+    if (isMergeOnRead(metaClient.getTableConfig())) {
+      HudiPositionalDeleteExtractor positionalDeletes =
+          new HudiPositionalDeleteExtractor(metaClient, viewManager);
+      completeInstant(
+          metaClient,
+          changes,
+          positionalDeletes.positionsDeletedBy(commitMetadata, completedInstant),
+          false,
+          deleteOperation,
+          positionalDeletes::holdsNoLiveRows);
+    } else {
+      completeInstant(metaClient, changes, null, false, deleteOperation, null);
+    }
   }
 
   @Override
@@ -352,14 +360,16 @@ public class IcebergTableFormat implements HoodieTableFormat {
     if (isMergeOnRead(metaClient.getTableConfig())) {
       // The log files the rollback deleted no longer delete anything, and a base file it restored
       // is deleted from by the log files its file group still has.
+      HudiPositionalDeleteExtractor positionalDeletes =
+          new HudiPositionalDeleteExtractor(metaClient, viewManager);
       completeInstant(
           metaClient,
           changes,
-          new HudiPositionalDeleteExtractor(metaClient, viewManager)
-              .positionsDeletedAfter(
-                  rollbackMetadata, publishedCommitTimes, filesRemovedByRolledBackCommits),
+          positionalDeletes.positionsDeletedAfter(
+              rollbackMetadata, publishedCommitTimes, filesRemovedByRolledBackCommits),
           true,
-          false);
+          false,
+          positionalDeletes::holdsNoLiveRows);
     } else {
       completeInstant(metaClient, changes);
     }
@@ -467,7 +477,7 @@ public class IcebergTableFormat implements HoodieTableFormat {
   }
 
   private void completeInstant(HoodieTableMetaClient metaClient, IncrementalTableChanges changes) {
-    completeInstant(metaClient, changes, null, false, false);
+    completeInstant(metaClient, changes, null, false, false, null);
   }
 
   /**
@@ -477,14 +487,20 @@ public class IcebergTableFormat implements HoodieTableFormat {
    *     base file rather than being merged into it
    * @param deleteOperation whether the instant is a Hudi delete, which Iceberg labels a delete even
    *     when it matched no rows
+   * @param withoutLiveRows whether no row of the base file at a path is live, for a base file
+   *     Iceberg no longer holds since a delete removed all of its rows; null when there is none
    */
   private void completeInstant(
       HoodieTableMetaClient metaClient,
       IncrementalTableChanges changes,
       Map<String, Set<Long>> deletedPositionsByBaseFile,
       boolean replaceDeletionVectors,
-      boolean deleteOperation) {
+      boolean deleteOperation,
+      Predicate<String> withoutLiveRows) {
     IcebergConversionTarget target = getIcebergConversionTarget(metaClient);
+    if (withoutLiveRows != null) {
+      target.stageDataFilesWithoutLiveRows(withoutLiveRows);
+    }
     if (deletedPositionsByBaseFile != null) {
       List<TableChange> tableChanges = new ArrayList<>();
       changes.getTableChanges().forEachRemaining(tableChanges::add);
