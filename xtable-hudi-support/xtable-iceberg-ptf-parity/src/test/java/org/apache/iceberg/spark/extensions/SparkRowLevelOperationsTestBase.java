@@ -541,7 +541,10 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkTestHelperBas
           "testCoalesceMerge",
           "the case inserts every primary key four times; Hudi refuses the repeated INSERT only"
               + " where it looks the table up, which it does not do on a merge-on-read table"
-              + " with the simple index");
+              + " with the simple index",
+          "testMergeWithStaticPredicatePushDown",
+          "the case inserts primary key 1 into two partitions; Hudi refuses the second INSERT"
+              + " where it looks the table up (copy-on-write), but not on a merge-on-read table");
 
   /** Runs a statement, noting a failure that breaks a primary key rule before passing it on. */
   private <T> T runStatement(String statement, Supplier<T> run) {
