@@ -23,13 +23,17 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+
+import lombok.extern.log4j.Log4j2;
 
 import org.apache.hadoop.conf.Configuration;
 
@@ -47,10 +51,13 @@ import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.HoodieTableVersion;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.timeline.InstantComparison;
 import org.apache.hudi.common.table.timeline.TimelineFactory;
 import org.apache.hudi.common.table.view.FileSystemViewManager;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.config.HoodieArchivalConfig;
 import org.apache.hudi.keygen.constant.KeyGeneratorType;
+import org.apache.hudi.metadata.HoodieTableMetadata;
 import org.apache.hudi.metadata.TableMetadataFactory;
 
 import org.apache.iceberg.Snapshot;
@@ -88,6 +95,7 @@ import org.apache.xtable.timeline.IcebergSnapshotInstants;
 import org.apache.xtable.timeline.IcebergTimelineArchiver;
 import org.apache.xtable.timeline.IcebergTimelineFactory;
 
+@Log4j2
 public class IcebergTableFormat implements HoodieTableFormat {
   /**
    * The partition type a custom key generator records for a field whose value is the partition path
@@ -123,10 +131,6 @@ public class IcebergTableFormat implements HoodieTableFormat {
       HoodieEngineContext engineContext,
       HoodieTableMetaClient metaClient,
       FileSystemViewManager viewManager) {
-    // Hudi deletes a disabled metadata table during the write, after the meta client loaded the
-    // table config, so the check reads it afresh.
-    requireMetadataTableDisabled(
-        HoodieTableConfig.loadFromHoodieProps(metaClient.getStorage(), metaClient.getMetaPath()));
     HudiIncrementalTableChangeExtractor hudiTableExtractor =
         getHudiTableExtractor(metaClient, viewManager);
     completeInstant(
@@ -159,7 +163,63 @@ public class IcebergTableFormat implements HoodieTableFormat {
             .table(
                 metaClient,
                 metaClient.getActiveTimeline().filterCompletedInstants().lastInstant().get());
-    archiveInstants(metaClient, internalTable, archivedInstants.get());
+    List<HoodieInstant> archived = archivedInstants.get();
+    archiveInstants(metaClient, internalTable, archived);
+    warnIfArchivedAheadOfMetadataTableCompaction(engineContext, metaClient, archived);
+  }
+
+  /**
+   * Hudi's archiver keeps a commit active until the metadata table has compacted its log block, but
+   * applies that bound to the native format only, so under this format the archiver can run ahead
+   * of the compaction. The instants are already archived when this hook runs, and the write has
+   * committed in Hudi and Iceberg, so this only warns: failing here would fail a committed write. A
+   * metadata table without a compaction yet, such as a freshly built one, is not reported, and
+   * neither is one that cannot be read, as when this write turned it off.
+   */
+  static void warnIfArchivedAheadOfMetadataTableCompaction(
+      HoodieEngineContext engineContext,
+      HoodieTableMetaClient metaClient,
+      List<HoodieInstant> archivedInstants) {
+    if (!metaClient.getTableConfig().isMetadataTableAvailable()) {
+      return;
+    }
+    Optional<HoodieInstant> latestArchivedCommit =
+        archivedInstants.stream()
+            .filter(HoodieInstant::isCompleted)
+            .filter(instant -> !HoodieTimeline.CLEAN_ACTION.equals(instant.getAction()))
+            .filter(instant -> !HoodieTimeline.SAVEPOINT_ACTION.equals(instant.getAction()))
+            .max(Comparator.comparing(HoodieInstant::requestedTime));
+    if (!latestArchivedCommit.isPresent()) {
+      return;
+    }
+    Option<String> latestCompaction;
+    try (HoodieTableMetadata metadata =
+        IcebergMetadataFactory.getInstance()
+            .create(
+                engineContext,
+                metaClient.getStorage(),
+                HoodieMetadataConfig.newBuilder().enable(true).build(),
+                metaClient.getBasePath().toString(),
+                false)) {
+      latestCompaction = metadata.getLatestCompactionTime();
+    } catch (Exception e) {
+      log.warn("Unable to read the latest compaction of the Hudi metadata table", e);
+      return;
+    }
+    if (latestCompaction.isPresent()
+        && InstantComparison.compareTimestamps(
+            latestArchivedCommit.get().requestedTime(),
+            InstantComparison.GREATER_THAN_OR_EQUALS,
+            latestCompaction.get())) {
+      log.warn(
+          "Table {} archived {} before the Hudi metadata table compacted it (latest metadata table"
+              + " compaction: {}); keep {} above {} so the metadata table listing stays complete",
+          metaClient.getTableConfig().getTableName(),
+          latestArchivedCommit.get(),
+          latestCompaction.get(),
+          HoodieArchivalConfig.MIN_COMMITS_TO_KEEP.key(),
+          HoodieMetadataConfig.COMPACT_NUM_DELTA_COMMITS.key());
+    }
   }
 
   /**
@@ -491,32 +551,6 @@ public class IcebergTableFormat implements HoodieTableFormat {
     return Arrays.stream(partitionFields.get())
         .map(field -> field + ":" + PartitionTransformType.VALUE)
         .collect(Collectors.joining(","));
-  }
-
-  /**
-   * The Hudi metadata table has to stay off: {@link IcebergMetadataFactory} serves the table's
-   * metadata from a file system listing that answers no index lookup, so once a writer has built
-   * the metadata table, a lookup that relies on it fails with "Unsupported operation:
-   * getColumnsStats". Hudi enables the metadata table by default, and the writer's configuration
-   * does not reach the format, so the check reads the metadata partitions the table config records
-   * as built.
-   *
-   * <p>Only commits are refused. A refused commit has no snapshot, so the next writer rolls it back
-   * and nothing it wrote reaches Iceberg. A clean or a rollback has deleted its files by the time
-   * its hook runs, so refusing one would leave Iceberg pointing at deleted files; Hudi's Spark
-   * procedures, such as rollback_to_instant, also leave the metadata table at its default and build
-   * one, which the next writer with it disabled deletes.
-   *
-   * @throws UnsupportedOperationException when a writer has built the metadata table
-   */
-  static void requireMetadataTableDisabled(HoodieTableConfig tableConfig) {
-    if (tableConfig.isMetadataTableAvailable()) {
-      throw new UnsupportedOperationException(
-          String.format(
-              "The Iceberg table format does not support the Hudi metadata table, but table %s has "
-                  + "one; set %s=false on every writer of the table and remove the metadata table",
-              tableConfig.getTableName(), HoodieMetadataConfig.ENABLE.key()));
-    }
   }
 
   private HudiIncrementalTableChangeExtractor getHudiTableExtractor(
