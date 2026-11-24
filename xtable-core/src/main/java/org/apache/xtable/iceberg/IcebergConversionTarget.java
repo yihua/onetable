@@ -94,6 +94,8 @@ public class IcebergConversionTarget implements ConversionTarget {
   /** Deletion vector files the staged row delta wrote, which only its commit makes referenced. */
   private Set<String> uncommittedDeletionVectorFiles = Collections.emptySet();
 
+  private boolean stagedDeleteOperation;
+
   public IcebergConversionTarget() {}
 
   IcebergConversionTarget(
@@ -313,6 +315,14 @@ public class IcebergConversionTarget implements ConversionTarget {
     this.stagedPositionsReplaceDeletionVectors = replaceDeletionVectors;
   }
 
+  /**
+   * Marks the next {@link #syncFilesForDiff} as the diff of a source commit that deletes rows, so
+   * that it is published as an Iceberg delete even when it changes no files.
+   */
+  public void stageDeleteOperation() {
+    this.stagedDeleteOperation = true;
+  }
+
   @Override
   public void syncFilesForDiff(InternalFilesDiff internalFilesDiff) {
     if (stagedDeletedPositions != null) {
@@ -324,6 +334,7 @@ public class IcebergConversionTarget implements ConversionTarget {
               stagedDeletedPositions,
               stagedPartitionsOfDataFiles,
               stagedPositionsReplaceDeletionVectors,
+              stagedDeleteOperation,
               transaction.table().schema(),
               transaction.table().spec(),
               tableSyncMetadata);
@@ -332,6 +343,7 @@ public class IcebergConversionTarget implements ConversionTarget {
     dataFileUpdatesExtractor.applyDiff(
         transaction,
         internalFilesDiff,
+        stagedDeleteOperation,
         transaction.table().schema(),
         transaction.table().spec(),
         tableSyncMetadata);
@@ -462,6 +474,7 @@ public class IcebergConversionTarget implements ConversionTarget {
     stagedDeletedPositions = null;
     stagedPartitionsOfDataFiles = null;
     uncommittedDeletionVectorFiles = Collections.emptySet();
+    stagedDeleteOperation = false;
   }
 
   private void rollbackCorruptCommits() {
