@@ -21,6 +21,7 @@ package org.apache.xtable;
 import static java.util.stream.Collectors.groupingBy;
 import static org.apache.hudi.hadoop.fs.HadoopFSUtils.getStorageConf;
 import static org.apache.xtable.IcebergTableAssertions.assertIcebergReferencesExactly;
+import static org.apache.xtable.IcebergTableAssertions.assertPublishedAsARewrite;
 import static org.apache.xtable.IcebergTableAssertions.baseFilesWithRows;
 import static org.apache.xtable.IcebergTableAssertions.icebergRowCount;
 import static org.apache.xtable.IcebergTableAssertions.icebergTable;
@@ -571,6 +572,7 @@ public class ITIcebergVariousActions {
 
       // Clustering replaces the empty file group along with the others.
       table.cluster();
+      assertPublishedAsARewrite(table.getBasePath());
       assertFalse(
           table.getAllLatestBaseFilePaths().stream()
               .anyMatch(path -> emptyFileGroup.equals(fileId(path))));

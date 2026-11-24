@@ -19,6 +19,8 @@
 package org.apache.xtable;
 
 import static org.apache.xtable.IcebergTableAssertions.assertNothingPending;
+import static org.apache.xtable.IcebergTableAssertions.assertPublishedAsARewrite;
+import static org.apache.xtable.IcebergTableAssertions.icebergTable;
 import static org.apache.xtable.IcebergTableAssertions.reconstructedTimeline;
 import static org.apache.xtable.MergeOnReadAssertions.assertIcebergMatchesHudi;
 import static org.apache.xtable.MergeOnReadAssertions.deletedKeysByDataFileInIceberg;
@@ -58,6 +60,8 @@ import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.CompactionUtils;
+
+import org.apache.iceberg.SnapshotSummary;
 
 /**
  * A delete written while a compaction of its file group is scheduled carries positions of the base
@@ -114,6 +118,10 @@ class ITIcebergMorDvPendingCompaction {
       assertEquals(95, icebergRows(spark, basePath).size());
 
       table.completeScheduledCompaction(compaction);
+      assertPublishedAsARewrite(basePath);
+      assertEquals(
+          "1",
+          icebergTable(basePath).currentSnapshot().summary().get(SnapshotSummary.ADDED_DVS_PROP));
       assertEquals(95, MergeOnReadAssertions.hudiRows(spark, basePath).size());
       assertIcebergMatchesHudi(spark, basePath);
       // The compaction applied the twenty deletes written before it was scheduled; the sixty-five

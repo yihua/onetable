@@ -104,6 +104,8 @@ public class IcebergConversionTarget implements ConversionTarget {
   /** Null when every data file the next files diff references has to be in the table. */
   private Predicate<String> stagedDataFilesWithoutLiveRows;
 
+  private boolean stagedRewrite;
+
   public IcebergConversionTarget() {}
 
   IcebergConversionTarget(
@@ -374,7 +376,8 @@ public class IcebergConversionTarget implements ConversionTarget {
    * Tells the next {@link #syncFilesForDiff} which data files the source holds no live rows of. A
    * row delta removes a data file whose rows a delete removes in full, so a later diff of the
    * source can still reference it; the diff leaves such a file out when the table does not hold it,
-   * see {@link IcebergDataFileUpdatesSync#applyRowDelta}.
+   * see {@link IcebergDataFileUpdatesSync#applyRowDelta} and {@link
+   * IcebergDataFileUpdatesSync#applyRewrite}.
    *
    * @param withoutLiveRows whether the source holds no live rows of the data file at a path
    */
@@ -382,8 +385,34 @@ public class IcebergConversionTarget implements ConversionTarget {
     this.stagedDataFilesWithoutLiveRows = withoutLiveRows;
   }
 
+  /**
+   * Marks the next {@link #syncFilesForDiff} as the diff of a source commit that rewrites data
+   * files and keeps every row, as a compaction or a clustering does, so that it is published as an
+   * Iceberg replace, see {@link IcebergDataFileUpdatesSync#applyRewrite}. A diff that Iceberg
+   * cannot express as a rewrite is published as any other.
+   */
+  public void stageRewrite() {
+    this.stagedRewrite = true;
+  }
+
   @Override
   public void syncFilesForDiff(InternalFilesDiff internalFilesDiff) {
+    if (stagedRewrite) {
+      Set<String> deletionVectorFiles =
+          dataFileUpdatesExtractor.applyRewrite(
+              table,
+              transaction,
+              internalFilesDiff,
+              stagedDeletedPositions == null ? Collections.emptyMap() : stagedDeletedPositions,
+              stagedDataFilesWithoutLiveRows,
+              transaction.table().schema(),
+              transaction.table().spec(),
+              tableSyncMetadata);
+      if (deletionVectorFiles != null) {
+        uncommittedDeletionVectorFiles = deletionVectorFiles;
+        return;
+      }
+    }
     if (stagedDeletedPositions != null) {
       uncommittedDeletionVectorFiles =
           dataFileUpdatesExtractor.applyRowDelta(
@@ -536,6 +565,7 @@ public class IcebergConversionTarget implements ConversionTarget {
     uncommittedDeletionVectorFiles = Collections.emptySet();
     stagedDeleteOperation = false;
     stagedDataFilesWithoutLiveRows = null;
+    stagedRewrite = false;
   }
 
   private void rollbackCorruptCommits() {

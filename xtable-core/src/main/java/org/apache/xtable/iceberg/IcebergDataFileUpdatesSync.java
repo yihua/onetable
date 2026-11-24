@@ -46,6 +46,7 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.OverwriteFiles;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
@@ -334,6 +335,114 @@ public class IcebergDataFileUpdatesSync {
     try {
       rowDelta.set(TableSyncMetadata.XTABLE_METADATA, metadata.toJson());
       rowDelta.commit();
+    } catch (RuntimeException e) {
+      deleteUncommittedFiles(table.io(), deletionVectorFiles);
+      throw e;
+    }
+    return deletionVectorFiles;
+  }
+
+  /**
+   * Commits a files diff of a source commit that rewrites data files and keeps every row, as a
+   * compaction or a clustering does, as one Iceberg replace snapshot, the way Iceberg's own rewrite
+   * of data files publishes it, which readers of the table's changes skip. The deletion vectors of
+   * the files it removes go with them, and the positions still deleted from a file it adds become
+   * that file's deletion vector. The added data files take the data sequence number of the snapshot
+   * the rewrite starts from, as Iceberg's rewrite does by default, so that a delete committed after
+   * that snapshot still applies to their rows, and so do the deletion vectors the commit adds,
+   * which take its own.
+   *
+   * @param deletedPositionsByDataFile row positions deleted from the data files the diff adds,
+   *     keyed by their paths
+   * @param withoutLiveRows whether the source holds no live rows of the data file at a path, which
+   *     the diff then may remove although the table does not hold it, see {@link #applyRowDelta};
+   *     null when every file the diff removes has to be in the table
+   * @return the deletion vector files written for the commit, or null without committing anything
+   *     when Iceberg cannot express the diff as a rewrite: it removes no data file the table holds
+   *     or one the table does not hold, deletes positions of a file it does not add, or adds
+   *     deletion vectors without removing one
+   */
+  public Set<String> applyRewrite(
+      Table table,
+      Transaction transaction,
+      InternalFilesDiff internalFilesDiff,
+      Map<String, ? extends Collection<Long>> deletedPositionsByDataFile,
+      Predicate<String> withoutLiveRows,
+      Schema schema,
+      PartitionSpec partitionSpec,
+      TableSyncMetadata metadata) {
+    Snapshot startingSnapshot = transaction.table().currentSnapshot();
+    Map<String, DataFile> filesAdded =
+        dataFiles(internalFilesDiff.dataFilesAdded(), schema, partitionSpec);
+    Map<String, Collection<Long>> positions = new LinkedHashMap<>();
+    deletedPositionsByDataFile.forEach(
+        (path, deleted) -> {
+          if (!deleted.isEmpty()) {
+            positions.put(path, deleted);
+          }
+        });
+    if (startingSnapshot == null
+        || internalFilesDiff.dataFilesRemoved().isEmpty()
+        || !filesAdded.keySet().containsAll(positions.keySet())) {
+      return null;
+    }
+    Set<List<PartitionValue>> partitions = new LinkedHashSet<>();
+    internalFilesDiff.dataFilesRemoved().forEach(file -> partitions.add(file.getPartitionValues()));
+    Set<String> filesRemoved =
+        dataFiles(internalFilesDiff.dataFilesRemoved(), schema, partitionSpec).keySet();
+    Map<String, FileScanTask> liveFiles =
+        liveFiles(
+            table,
+            filesRemoved,
+            filesAdded.keySet(),
+            partitionValueConverter.partitionFilter(partitionSpec, schema, partitions));
+    List<FileScanTask> replaced = new ArrayList<>();
+    for (String path : filesRemoved) {
+      FileScanTask liveFile = liveFiles.get(path);
+      if (liveFile != null) {
+        replaced.add(liveFile);
+      } else if (!holdsNoLiveRows(withoutLiveRows, path)) {
+        return null;
+      }
+    }
+    List<DeleteFile> replacedDeletionVectors =
+        replaced.stream()
+            .flatMap(liveFile -> liveFile.deletes().stream())
+            .filter(ContentFileUtil::isDV)
+            .collect(Collectors.toList());
+    if (replaced.isEmpty() || (!positions.isEmpty() && replacedDeletionVectors.isEmpty())) {
+      return null;
+    }
+    if (!positions.isEmpty()) {
+      requireDeletionVectors(table);
+    }
+    RewriteFiles rewrite =
+        transaction
+            .newRewrite()
+            .validateFromSnapshot(startingSnapshot.snapshotId())
+            .dataSequenceNumber(startingSnapshot.sequenceNumber());
+    replaced.forEach(liveFile -> rewrite.deleteFile(liveFile.file()));
+    replacedDeletionVectors.forEach(rewrite::deleteFile);
+    filesAdded.values().forEach(rewrite::addFile);
+    Set<String> deletionVectorFiles = Collections.emptySet();
+    if (!positions.isEmpty()) {
+      DeleteWriteResult written =
+          writeDeletionVectors(
+              table,
+              positions,
+              Collections.emptyMap(),
+              filesAdded,
+              Collections.emptyMap(),
+              partitionSpec);
+      written.deleteFiles().forEach(rewrite::addFile);
+      deletionVectorFiles =
+          written.deleteFiles().stream()
+              .map(DeleteFile::location)
+              .collect(Collectors.toCollection(HashSet::new));
+    }
+    try {
+      rewrite.set(TableSyncMetadata.XTABLE_METADATA, metadata.toJson());
+      rewrite.commit();
     } catch (RuntimeException e) {
       deleteUncommittedFiles(table.io(), deletionVectorFiles);
       throw e;

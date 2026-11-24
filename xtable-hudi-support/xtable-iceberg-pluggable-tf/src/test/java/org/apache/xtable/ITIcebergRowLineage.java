@@ -19,6 +19,7 @@
 package org.apache.xtable;
 
 import static org.apache.xtable.IcebergTableAssertions.assertNothingPending;
+import static org.apache.xtable.IcebergTableAssertions.assertPublishedAsARewrite;
 import static org.apache.xtable.IcebergTableAssertions.createWithTableConfig;
 import static org.apache.xtable.IcebergTableAssertions.icebergTable;
 import static org.apache.xtable.IcebergTableAssertions.reconstructedTimeline;
@@ -177,6 +178,7 @@ class ITIcebergRowLineage {
       assertRewritten(tracker.next(), 60, 6, 0);
 
       table.cluster();
+      assertPublishedAsARewrite(basePath);
       Changes clustering = tracker.next();
       assertChanges(clustering, 66, 0, 0);
       assertEquals(66, clustering.unchangedMovedToAnotherFile);
@@ -216,6 +218,7 @@ class ITIcebergRowLineage {
       assertRewritten(tracker.next(), 60 - updates.size(), updates.size(), updates.size());
 
       table.cluster();
+      assertPublishedAsARewrite(basePath);
       Changes clustering = tracker.next();
       assertChanges(clustering, 60, 0, 0);
       assertEquals(60, clustering.unchangedMovedToAnotherFile);
@@ -250,6 +253,7 @@ class ITIcebergRowLineage {
       assertIcebergMatchesHudi(spark, basePath);
 
       table.compact();
+      assertPublishedAsARewrite(basePath);
       Changes compaction = tracker.next();
       assertRewritten(compaction, 75, 0, 0);
       assertIcebergMatchesHudi(spark, basePath);
@@ -258,6 +262,7 @@ class ITIcebergRowLineage {
       assertInPlace(tracker.next(), 70, 5, 5);
 
       table.cluster();
+      assertPublishedAsARewrite(basePath);
       Changes clustering = tracker.next();
       assertChanges(clustering, 75, 0, 0);
       assertEquals(75, clustering.unchangedMovedToAnotherFile);

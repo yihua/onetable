@@ -163,20 +163,36 @@ public class IcebergTableFormat implements HoodieTableFormat {
         getHudiTableExtractor(metaClient, viewManager);
     IncrementalTableChanges changes =
         hudiTableExtractor.extractTableChanges(commitMetadata, completedInstant);
-    boolean deleteOperation = WriteOperationType.isDelete(commitMetadata.getOperationType());
-    if (isMergeOnRead(metaClient.getTableConfig())) {
-      HudiPositionalDeleteExtractor positionalDeletes =
-          new HudiPositionalDeleteExtractor(metaClient, viewManager);
-      completeInstant(
-          metaClient,
-          changes,
-          positionalDeletes.positionsDeletedBy(commitMetadata, completedInstant),
-          false,
-          deleteOperation,
-          positionalDeletes::holdsNoLiveRows);
-    } else {
-      completeInstant(metaClient, changes, null, false, deleteOperation, null);
-    }
+    boolean rewrite =
+        rewritesWithoutChangingRows(commitMetadata, completedInstant, metaClient.getTableConfig());
+    boolean deleteOperation =
+        !rewrite && WriteOperationType.isDelete(commitMetadata.getOperationType());
+    HudiPositionalDeleteExtractor positionalDeletes =
+        new HudiPositionalDeleteExtractor(metaClient, viewManager);
+    completeInstant(
+        metaClient,
+        changes,
+        isMergeOnRead(metaClient.getTableConfig())
+            ? positionalDeletes.positionsDeletedBy(commitMetadata, completedInstant)
+            : null,
+        false,
+        deleteOperation,
+        positionalDeletes::holdsNoLiveRows,
+        rewrite);
+  }
+
+  /**
+   * Whether the instant rewrites base files without changing any row: a clustering, or a
+   * compaction, which on a merge-on-read table is the only instant that completes as a commit, see
+   * {@link HudiPositionalDeleteExtractor#positionsDeletedBy}. Iceberg publishes such a rewrite as a
+   * replace, which streaming readers skip. An insert that Hudi packs into a small base file also
+   * rewrites the file, but adds rows.
+   */
+  static boolean rewritesWithoutChangingRows(
+      HoodieCommitMetadata commitMetadata, HoodieInstant instant, HoodieConfig tableConfig) {
+    return HoodieTimeline.CLUSTERING_ACTION.equals(instant.getAction())
+        || commitMetadata.getOperationType() == WriteOperationType.CLUSTER
+        || (isMergeOnRead(tableConfig) && HoodieTimeline.COMMIT_ACTION.equals(instant.getAction()));
   }
 
   @Override
@@ -369,7 +385,8 @@ public class IcebergTableFormat implements HoodieTableFormat {
               rollbackMetadata, publishedCommitTimes, filesRemovedByRolledBackCommits),
           true,
           false,
-          positionalDeletes::holdsNoLiveRows);
+          positionalDeletes::holdsNoLiveRows,
+          false);
     } else {
       completeInstant(metaClient, changes);
     }
@@ -477,7 +494,7 @@ public class IcebergTableFormat implements HoodieTableFormat {
   }
 
   private void completeInstant(HoodieTableMetaClient metaClient, IncrementalTableChanges changes) {
-    completeInstant(metaClient, changes, null, false, false, null);
+    completeInstant(metaClient, changes, null, false, false, null, false);
   }
 
   /**
@@ -488,7 +505,10 @@ public class IcebergTableFormat implements HoodieTableFormat {
    * @param deleteOperation whether the instant is a Hudi delete, which Iceberg labels a delete even
    *     when it matched no rows
    * @param withoutLiveRows whether no row of the base file at a path is live, for a base file
-   *     Iceberg no longer holds since a delete removed all of its rows; null when there is none
+   *     Iceberg does not hold since it holds no rows or a delete removed all of them; null when
+   *     there is none
+   * @param rewrite whether the instant rewrites base files without changing any row, which Iceberg
+   *     publishes as a replace
    */
   private void completeInstant(
       HoodieTableMetaClient metaClient,
@@ -496,10 +516,14 @@ public class IcebergTableFormat implements HoodieTableFormat {
       Map<String, Set<Long>> deletedPositionsByBaseFile,
       boolean replaceDeletionVectors,
       boolean deleteOperation,
-      Predicate<String> withoutLiveRows) {
+      Predicate<String> withoutLiveRows,
+      boolean rewrite) {
     IcebergConversionTarget target = getIcebergConversionTarget(metaClient);
     if (withoutLiveRows != null) {
       target.stageDataFilesWithoutLiveRows(withoutLiveRows);
+    }
+    if (rewrite) {
+      target.stageRewrite();
     }
     if (deletedPositionsByBaseFile != null) {
       List<TableChange> tableChanges = new ArrayList<>();
