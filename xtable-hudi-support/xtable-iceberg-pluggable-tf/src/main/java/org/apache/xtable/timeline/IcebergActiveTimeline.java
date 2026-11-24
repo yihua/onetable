@@ -197,9 +197,13 @@ public class IcebergActiveTimeline extends ActiveTimelineV2 {
     }
     // Snapshots older than the oldest retained one have been expired, by the archiver or by an
     // Iceberg expire-snapshots run, so a completed instant older than the oldest recorded instant
-    // is history rather than pending work. A commit that still has its markers is the exception:
-    // its publish failed before postCommit deleted them, and under lazy failed-write cleaning a
-    // later write lands the first snapshot before the failed commit is rolled back.
+    // is history rather than pending work. A commit that still has its markers is the exception
+    // while the oldest retained snapshot is the table's first: its publish failed before
+    // postCommit deleted them, and under lazy failed-write cleaning a later write lands the first
+    // snapshot before the failed commit is rolled back. Once older snapshots were expired, which
+    // leaves the oldest retained one with a parent id, markers no longer tell a failed publish
+    // apart from a published commit that kept them, so the commit is history.
+    boolean olderSnapshotsExpired = !ancestors.isEmpty() && ancestors.get(0).parentId() != null;
     Option<HoodieInstant> oldestRecordedInstant =
         ancestors.isEmpty()
             ? Option.empty()
@@ -216,6 +220,7 @@ public class IcebergActiveTimeline extends ActiveTimelineV2 {
                   }
                   if (completedBeforeRetainedHistory(instant, oldestRecordedInstant)
                       && !(COMMIT_ACTIONS.contains(instant.getAction())
+                          && !olderSnapshotsExpired
                           && hasMarkers(metaClient, instant))) {
                     expiredHistory.add(instantKey(instant));
                     return instant;

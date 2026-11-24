@@ -55,6 +55,7 @@ import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.metadata.HoodieTableMetadataUtil;
+import org.apache.hudi.storage.StoragePath;
 
 import org.apache.iceberg.Table;
 
@@ -263,6 +264,41 @@ class ITIcebergTimelineRecovery {
       assertIcebergReferencesExactly(table.getBasePath(), table.getAllLatestBaseFilePaths());
       assertEquals(50, icebergRowCount(table.getBasePath()));
       assertNothingPending(reconstructedTimeline(table.getBasePath()));
+    }
+  }
+
+  @Test
+  void expiredCommitThatKeptItsMarkersStaysHistory() throws IOException {
+    try (TestJavaHudiTable table = newTable()) {
+      List<String> commits = new ArrayList<>();
+      for (int i = 0; i < 3; i++) {
+        String commit = table.startCommit();
+        table.insertRecordsWithCommitAlreadyStarted(table.generateRecords(10), commit, true);
+        commits.add(commit);
+      }
+      // The second commit published its snapshot but kept its markers, as when deleting them
+      // failed or the writer stopped before postCommit.
+      table
+          .getMetaClient()
+          .getStorage()
+          .createDirectory(
+              new StoragePath(table.getMetaClient().getMarkerFolderPath(commits.get(1))));
+      icebergTable(table.getBasePath())
+          .expireSnapshots()
+          .expireOlderThan(System.currentTimeMillis())
+          .retainLast(1)
+          .commit();
+
+      HoodieTimeline timeline = reconstructedTimeline(table.getBasePath());
+      assertEquals(commits, completedCommitTimes(timeline));
+      assertNothingPending(timeline);
+
+      // Reported pending, the commit would be rolled back by the next clean, which deletes its
+      // files while Iceberg keeps referencing them.
+      table.insertRecords(10, true);
+      table.getWriteClient().clean();
+      assertIcebergReferencesExactly(table.getBasePath(), table.getAllLatestBaseFilePaths());
+      assertEquals(40, icebergRowCount(table.getBasePath()));
     }
   }
 
