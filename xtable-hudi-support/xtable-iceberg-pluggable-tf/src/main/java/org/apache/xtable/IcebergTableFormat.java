@@ -800,6 +800,7 @@ public class IcebergTableFormat implements HoodieTableFormat {
     // A copy, since the meta client's configuration is shared with the rest of the writer.
     Configuration conf = new Configuration((Configuration) metaClient.getStorageConf().unwrap());
     conf.setInt(IcebergTableManager.ICEBERG_FORMAT_VERSION, config.getFormatVersion());
+    conf.setBoolean(IcebergTableManager.ICEBERG_REMOVE_PLACEHOLDER_SCHEMA, true);
     return (IcebergConversionTarget)
         ConversionTargetFactory.getInstance().createForFormat(targetTable, conf);
   }

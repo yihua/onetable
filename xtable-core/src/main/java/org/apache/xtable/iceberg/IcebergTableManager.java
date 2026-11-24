@@ -51,6 +51,15 @@ public class IcebergTableManager {
    */
   public static final String ICEBERG_FORMAT_VERSION = "xtable.iceberg.format-version";
 
+  /**
+   * Hadoop configuration key: when true, a table this manager creates does not keep the empty
+   * placeholder schema and unpartitioned spec it is first created with (see {@link
+   * #createTableIfMissing}). Some readers refuse a table whose metadata holds a schema with no
+   * fields. Defaults to false.
+   */
+  public static final String ICEBERG_REMOVE_PLACEHOLDER_SCHEMA =
+      "xtable.iceberg.remove-placeholder-schema";
+
   private static final int DEFAULT_ICEBERG_FORMAT_VERSION = 2;
   private static final Map<IcebergCatalogConfig, Catalog> CATALOG_CACHE = new ConcurrentHashMap<>();
   private final Configuration hadoopConfiguration;
@@ -132,6 +141,15 @@ public class IcebergTableManager {
         // one.
         builder.upgradeFormatVersion(formatVersion);
         operations.commit(tableMetadata, builder.build());
+        if (hadoopConfiguration.getBoolean(ICEBERG_REMOVE_PLACEHOLDER_SCHEMA, false)) {
+          // The table has no snapshots yet, so this removes only the schema and spec that are
+          // neither current nor default: the empty placeholders from the create above.
+          tableWithEmptySchema
+              .expireSnapshots()
+              .cleanExpiredMetadata(true)
+              .cleanExpiredFiles(false)
+              .commit();
+        }
         return getTable(catalogConfig, tableIdentifier, basePath);
       } catch (AlreadyExistsException ex) {
         log.info("Table {} not created since it already exists", tableIdentifier);
