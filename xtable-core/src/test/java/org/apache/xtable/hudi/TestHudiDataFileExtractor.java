@@ -231,6 +231,10 @@ class TestHudiDataFileExtractor {
     assertSame(
         nullPartition,
         HudiDataFileExtractor.requireTimestampPartitionValuesMatchStats(nullPartition));
+    // A column outside the indexed columns has no stats, and nothing shows another value.
+    InternalDataFile noStats =
+        timestampPartitionedFile(InternalType.TIMESTAMP, TEN_THIRTY_MICROS, null);
+    assertSame(noStats, HudiDataFileExtractor.requireTimestampPartitionValuesMatchStats(noStats));
   }
 
   @Test
@@ -254,11 +258,5 @@ class TestHudiDataFileExtractor {
     assertThrows(
         PartitionValuesExtractorException.class,
         () -> HudiDataFileExtractor.requireTimestampPartitionValuesMatchStats(shared));
-    // Without stats nothing shows the file holds only the partition value.
-    InternalDataFile noStats =
-        timestampPartitionedFile(InternalType.TIMESTAMP, TEN_THIRTY_MICROS, null);
-    assertThrows(
-        PartitionValuesExtractorException.class,
-        () -> HudiDataFileExtractor.requireTimestampPartitionValuesMatchStats(noStats));
   }
 }

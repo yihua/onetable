@@ -770,8 +770,10 @@ public class HudiDataFileExtractor implements AutoCloseable {
    * from the path again. So the path value is kept, and a file whose column stats show any other
    * value for a timestamp partition column is refused.
    *
-   * @throws PartitionValuesExtractorException when a timestamp partition column of the file holds a
-   *     value other than its partition value, or has no stats to show which values it holds
+   * <p>A file without stats for the column is kept, since nothing shows it holds another value.
+   *
+   * @throws PartitionValuesExtractorException when the column stats of a timestamp partition column
+   *     of the file show a value other than its partition value
    */
   static InternalDataFile requireTimestampPartitionValuesMatchStats(InternalDataFile file) {
     for (PartitionValue partitionValue : file.getPartitionValues()) {
@@ -791,6 +793,10 @@ public class HudiDataFileExtractor implements AutoCloseable {
               .findFirst();
       Object min = stat.map(s -> s.getRange().getMinValue()).orElse(null);
       Object max = stat.map(s -> s.getRange().getMaxValue()).orElse(null);
+      if (min == null && max == null) {
+        // The column is outside the indexed columns, or the file stores no stats for it.
+        continue;
+      }
       if (!value.equals(min) || !value.equals(max)) {
         throw new PartitionValuesExtractorException(
             String.format(
@@ -801,8 +807,8 @@ public class HudiDataFileExtractor implements AutoCloseable {
                     + " Partition by a column holding whole seconds or a coarser value instead",
                 file.getPhysicalPath(),
                 sourceField.getPath(),
-                stat.isPresent() ? render(min, sourceField) : "unknown (no column stats)",
-                stat.isPresent() ? render(max, sourceField) : "unknown (no column stats)",
+                render(min, sourceField),
+                render(max, sourceField),
                 render(value, sourceField)));
       }
     }
