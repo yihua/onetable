@@ -1511,14 +1511,15 @@ public class ITConversionController {
   }
 
   private static String[] getSelectColumnsArr(List<String> columnsToSelect, String format) {
-    boolean isHudi = format.equals(HUDI);
-    boolean isIceberg = format.equals(ICEBERG);
+    boolean localTimestampsAsTimestamps =
+        format.equals(HUDI) || format.equals(ICEBERG) || format.equals(DELTA);
     return columnsToSelect.stream()
         .map(
             colName -> {
-              if ((isHudi || isIceberg) && colName.startsWith("timestamp_local_millis")) {
+              if (localTimestampsAsTimestamps && colName.startsWith("timestamp_local_millis")) {
                 return String.format("unix_millis(CAST(%s AS TIMESTAMP)) AS %s", colName, colName);
-              } else if ((isHudi || isIceberg) && colName.startsWith("timestamp_local_micros")) {
+              } else if (localTimestampsAsTimestamps
+                  && colName.startsWith("timestamp_local_micros")) {
                 return String.format("unix_micros(CAST(%s AS TIMESTAMP)) AS %s", colName, colName);
               } else {
                 return colName;
