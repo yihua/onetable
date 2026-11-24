@@ -36,7 +36,6 @@ import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.mapping.MappedField;
 import org.apache.iceberg.mapping.MappedFields;
 import org.apache.iceberg.mapping.NameMapping;
-import org.apache.iceberg.parquet.ParquetSchemaUtil;
 import org.apache.iceberg.types.Types;
 
 import org.apache.xtable.hudi.idtracking.IdTracker;
@@ -94,7 +93,7 @@ public class HoodieAvroWriteSupportWithFieldIds extends HoodieAvroWriteSupport {
                       .map(HoodieAvroWriteSupportWithFieldIds::toMappedField)
                       .collect(Collectors.toList());
               addRowLineageFields(mappedFields);
-              return ParquetSchemaUtil.applyNameMapping(messageType, NameMapping.of(mappedFields));
+              return ParquetFieldIds.apply(messageType, NameMapping.of(mappedFields));
             })
         .orElse(messageType);
   }
