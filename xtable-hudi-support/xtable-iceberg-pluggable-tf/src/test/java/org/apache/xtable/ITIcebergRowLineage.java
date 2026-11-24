@@ -89,7 +89,8 @@ import org.apache.xtable.model.metadata.TableSyncMetadata;
 /**
  * Iceberg row lineage of a format version 3 table across the Hudi operations that rewrite base
  * files, read through Iceberg. A row that an operation carries over unchanged keeps its {@code
- * _row_id} and {@code _last_updated_sequence_number}; a new or updated row gets a new row id.
+ * _row_id} and {@code _last_updated_sequence_number}; an updated row keeps its row id and gets the
+ * sequence number of the operation, and a new row gets a new row id.
  */
 class ITIcebergRowLineage {
   @TempDir public static Path tempDir;
@@ -240,9 +241,10 @@ class ITIcebergRowLineage {
       table.insertRecords(30, true);
       Tracker tracker = new Tracker(basePath);
 
-      // An update is a delete from the base file and an insert into a new one.
+      // An update is a delete from the base file and an insert into a new one, which keeps the row
+      // id.
       table.upsertRecords(inserts.subList(0, 10), true);
-      assertInPlace(tracker.next(), 70, 10, 0);
+      assertInPlace(tracker.next(), 70, 10, 10);
       table.deleteRecords(inserts.subList(10, 15), true);
       assertInPlace(tracker.next(), 75, 0, 0);
       assertIcebergMatchesHudi(spark, basePath);
@@ -253,7 +255,7 @@ class ITIcebergRowLineage {
       assertIcebergMatchesHudi(spark, basePath);
 
       table.upsertRecords(inserts.subList(20, 25), true);
-      assertInPlace(tracker.next(), 70, 5, 0);
+      assertInPlace(tracker.next(), 70, 5, 5);
 
       table.cluster();
       Changes clustering = tracker.next();
@@ -261,7 +263,7 @@ class ITIcebergRowLineage {
       assertEquals(75, clustering.unchangedMovedToAnotherFile);
 
       table.upsertRecords(inserts.subList(25, 30), true);
-      assertInPlace(tracker.next(), 70, 5, 0);
+      assertInPlace(tracker.next(), 70, 5, 5);
       table.compact();
       assertRewritten(tracker.next(), 75, 0, 0);
       assertIcebergMatchesHudi(spark, basePath);
@@ -315,15 +317,22 @@ class ITIcebergRowLineage {
         .save(basePath);
   }
 
+  /**
+   * A merge-on-read update written as a delete and an insert puts the new version of a row into
+   * another data file, which stores the row id of the row it replaces, so the row keeps its id and
+   * gets the sequence number of the update; updating it again keeps the id once more.
+   */
   @Test
-  void mergeOnReadUpdateWrittenAsDeleteAndInsertGivesTheUpdatedRowsNewRowIds() {
+  void mergeOnReadUpdateWrittenAsDeleteAndInsertKeepsTheRowIds() {
     try (TestJavaHudiTable table =
         TestJavaHudiTable.forStandardSchema(
             tableName(), tempDir, null, HoodieTableType.MERGE_ON_READ, deletionVectorTable(10))) {
       List<HoodieRecord<HoodieAvroPayload>> inserts = table.insertRecords(20, true);
       Tracker tracker = new Tracker(table.getBasePath());
       table.upsertRecords(inserts.subList(0, 5), true);
-      assertInPlace(tracker.next(), 15, 5, 0);
+      assertInPlace(tracker.next(), 15, 5, 5);
+      table.upsertRecords(inserts.subList(3, 8), true);
+      assertInPlace(tracker.next(), 15, 5, 5);
     }
   }
 
