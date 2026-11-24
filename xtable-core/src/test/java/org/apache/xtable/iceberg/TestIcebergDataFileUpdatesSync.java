@@ -185,6 +185,24 @@ class TestIcebergDataFileUpdatesSync {
   }
 
   @Test
+  void aRowDeltaOfADeleteThatMatchesNoRowsIsPublishedAsADelete() {
+    Table table = newTable();
+    InternalDataFile a = dataFile(table, "a");
+    applyRowDelta(table, diff(Arrays.asList(a), NONE), NO_POSITIONS, false, metadata(0));
+
+    // Delete blocks located by record key that match no row leave an empty set for their file.
+    applyRowDelta(
+        table,
+        diff(NONE, NONE),
+        Collections.singletonMap(a.getPhysicalPath(), Collections.<Long>emptyList()),
+        true,
+        metadata(1));
+
+    assertEquals(Arrays.asList(DataOperations.APPEND, DataOperations.DELETE), operations(table));
+    assertEquals(metadata(1), currentMetadata(table));
+  }
+
+  @Test
   void anEmptyRowDeltaOfADeleteIsPublishedAsADelete() {
     Table table = newTable();
     applyRowDelta(

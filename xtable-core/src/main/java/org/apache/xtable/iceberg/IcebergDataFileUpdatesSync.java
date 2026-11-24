@@ -203,9 +203,12 @@ public class IcebergDataFileUpdatesSync {
       Schema schema,
       PartitionSpec partitionSpec,
       TableSyncMetadata metadata) {
+    // In merge mode an empty set of positions leaves the file's deletion vector as it is.
     if (deleteOperation
         && changesNoDataFiles(internalFilesDiff)
-        && deletedPositionsByDataFile.isEmpty()) {
+        && (deletedPositionsByDataFile.isEmpty()
+            || (!replaceDeletionVectors
+                && deletedPositionsByDataFile.values().stream().allMatch(Collection::isEmpty)))) {
       commitEmptyDelete(transaction, metadata);
       return Collections.emptySet();
     }
