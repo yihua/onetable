@@ -53,9 +53,9 @@ public class IcebergTableManager {
 
   /**
    * Hadoop configuration key: when true, a table this manager creates does not keep the empty
-   * placeholder schema and unpartitioned spec it is first created with (see {@link
-   * #createTableIfMissing}). Some readers refuse a table whose metadata holds a schema with no
-   * fields. Defaults to false.
+   * placeholder schema it is first created with (see {@link #createTableIfMissing}). Some readers
+   * refuse a table whose metadata holds a schema with no fields, and the AWS Glue Iceberg REST
+   * endpoint drops the table's name mapping property for such a table. Defaults to false.
    */
   public static final String ICEBERG_REMOVE_PLACEHOLDER_SCHEMA =
       "xtable.iceberg.remove-placeholder-schema";
@@ -140,21 +140,39 @@ public class IcebergTableManager {
         // Requesting the version the table was created with is a no-op; Iceberg rejects a lower
         // one.
         builder.upgradeFormatVersion(formatVersion);
-        operations.commit(tableMetadata, builder.build());
-        if (hadoopConfiguration.getBoolean(ICEBERG_REMOVE_PLACEHOLDER_SCHEMA, false)) {
-          // The table has no snapshots yet, so this removes only the schema and spec that are
-          // neither current nor default: the empty placeholders from the create above.
-          tableWithEmptySchema
-              .expireSnapshots()
-              .cleanExpiredMetadata(true)
-              .cleanExpiredFiles(false)
-              .commit();
+        if (hadoopConfiguration.getBoolean(ICEBERG_REMOVE_PLACEHOLDER_SCHEMA, false)
+            && tableMetadata.schema().columns().isEmpty()
+            && !schema.columns().isEmpty()) {
+          removeSchema(builder, tableMetadata.currentSchemaId());
         }
+        operations.commit(tableMetadata, builder.build());
         return getTable(catalogConfig, tableIdentifier, basePath);
       } catch (AlreadyExistsException ex) {
         log.info("Table {} not created since it already exists", tableIdentifier);
         return getTable(catalogConfig, tableIdentifier, basePath);
       }
+    }
+  }
+
+  /**
+   * Removes the empty placeholder schema in the same commit that sets the real one. Iceberg exposes
+   * schema removal only through its metadata builder, package-private, and through {@code
+   * ExpireSnapshots.cleanExpiredMetadata}, which also removes partition specs; the AWS Glue Iceberg
+   * REST endpoint rejects a {@code remove-partition-specs} update, so the unused placeholder spec
+   * is kept. A REST catalog receives this as a {@code remove-schemas} update. If the builder method
+   * is not available, the placeholder stays.
+   */
+  private static void removeSchema(TableMetadata.Builder builder, int schemaId) {
+    try {
+      java.lang.reflect.Method removeSchemas =
+          TableMetadata.Builder.class.getDeclaredMethod("removeSchemas", Iterable.class);
+      removeSchemas.setAccessible(true);
+      removeSchemas.invoke(builder, Collections.singleton(schemaId));
+    } catch (ReflectiveOperationException | RuntimeException e) {
+      log.warn(
+          "Could not remove the placeholder schema {}; it stays in the table metadata",
+          schemaId,
+          e);
     }
   }
 

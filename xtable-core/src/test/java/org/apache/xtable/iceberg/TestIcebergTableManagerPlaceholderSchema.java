@@ -71,16 +71,17 @@ public class TestIcebergTableManagerPlaceholderSchema {
 
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
-  void placeholderSchemaAndSpecRemovedWhenConfigured(boolean throughCatalog) {
+  void placeholderSchemaRemovedWhenConfigured(boolean throughCatalog) {
     Table table = create(throughCatalog, true, partitionedByRegion());
     TableMetadata metadata = ((BaseTable) table).operations().current();
 
     assertEquals(1, metadata.schemas().size(), "only the real schema is left");
     assertTrue(metadata.schemas().stream().noneMatch(s -> s.columns().isEmpty()));
     assertEquals(SCHEMA.asStruct(), table.schema().asStruct(), "field IDs are kept");
-    assertEquals(1, metadata.specs().size(), "only the real partition spec is left");
     assertEquals(
         "region", table.spec().fields().get(0).name(), "the partition spec is the given one");
+    // The unpartitioned placeholder spec stays: some REST catalogs reject removing a spec.
+    assertEquals(2, metadata.specs().size());
   }
 
   @ParameterizedTest
