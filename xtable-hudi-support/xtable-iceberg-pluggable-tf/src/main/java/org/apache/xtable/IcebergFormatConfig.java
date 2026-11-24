@@ -18,13 +18,16 @@
  
 package org.apache.xtable;
 
+import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 
 import lombok.Getter;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
 
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 
@@ -165,10 +168,52 @@ public class IcebergFormatConfig {
         metaClient.getBasePath().toString());
   }
 
+  /**
+   * @throws IllegalStateException when the catalog names a table at another location than the Hudi
+   *     base path, as when two Hudi tables of the same name share a catalog and namespace
+   */
   public Table getTable(IcebergTableManager tableManager, HoodieTableMetaClient metaClient) {
-    return tableManager.getTable(
-        catalogConfig,
-        tableIdentifier(metaClient.getTableConfig().getTableName()),
-        metaClient.getBasePath().toString());
+    String basePath = metaClient.getBasePath().toString();
+    TableIdentifier identifier = tableIdentifier(metaClient.getTableConfig().getTableName());
+    Table table = tableManager.getTable(catalogConfig, identifier, basePath);
+    if (catalogConfig != null && !sameLocation(table.location(), basePath)) {
+      throw new IllegalStateException(
+          String.format(
+              "Iceberg table %s in catalog %s is located at %s, not at the Hudi base path %s, so it"
+                  + " belongs to another Hudi table; give each Hudi table its own name or namespace"
+                  + " in the catalog",
+              identifier, catalogConfig.getCatalogName(), table.location(), basePath));
+    }
+    return table;
+  }
+
+  /**
+   * Compares the paths and authorities of two locations. A missing scheme matches any scheme, and
+   * the S3 schemes match each other, since a catalog may record the location with another S3
+   * filesystem's scheme than the writer uses.
+   */
+  static boolean sameLocation(String location, String basePath) {
+    URI first = new Path(location).toUri();
+    URI second = new Path(basePath).toUri();
+    return Objects.equals(trimTrailingSlash(first.getPath()), trimTrailingSlash(second.getPath()))
+        && Objects.equals(first.getAuthority(), second.getAuthority())
+        && compatibleSchemes(first.getScheme(), second.getScheme());
+  }
+
+  private static String trimTrailingSlash(String path) {
+    return path.length() > 1 && path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
+  }
+
+  private static boolean compatibleSchemes(String first, String second) {
+    if (first == null || second == null || first.equalsIgnoreCase(second)) {
+      return true;
+    }
+    return isS3(first) && isS3(second);
+  }
+
+  private static boolean isS3(String scheme) {
+    return scheme.equalsIgnoreCase("s3")
+        || scheme.equalsIgnoreCase("s3a")
+        || scheme.equalsIgnoreCase("s3n");
   }
 }

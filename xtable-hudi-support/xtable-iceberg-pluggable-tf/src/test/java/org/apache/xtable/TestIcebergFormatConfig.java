@@ -20,6 +20,7 @@ package org.apache.xtable;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -196,5 +197,15 @@ class TestIcebergFormatConfig {
     tableConfig.setProperty(IcebergFormatConfig.FORMAT_VERSION, "3");
     conf.set(IcebergTableManager.ICEBERG_FORMAT_VERSION, "2");
     assertEquals(3, IcebergFormatConfig.of(tableConfig, conf).getFormatVersion());
+  }
+
+  @Test
+  void locationsMatchAcrossSchemeSpellingsOnly() {
+    assertTrue(IcebergFormatConfig.sameLocation("file:/tmp/table", "/tmp/table"));
+    assertTrue(IcebergFormatConfig.sameLocation("file:///tmp/table/", "file:/tmp/table"));
+    assertTrue(IcebergFormatConfig.sameLocation("s3://bucket/a/table", "s3a://bucket/a/table"));
+    assertFalse(IcebergFormatConfig.sameLocation("file:/tmp/other", "/tmp/table"));
+    assertFalse(IcebergFormatConfig.sameLocation("s3://bucket/a/table", "s3a://other/a/table"));
+    assertFalse(IcebergFormatConfig.sameLocation("gs://bucket/a/table", "s3a://bucket/a/table"));
   }
 }

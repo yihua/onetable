@@ -26,8 +26,11 @@ import static org.apache.xtable.IcebergTableAssertions.icebergTableExists;
 import static org.apache.xtable.IcebergTableAssertions.reconstructedTimeline;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashSet;
@@ -184,6 +187,28 @@ class ITIcebergCatalogTable {
       assertIcebergReferencesExactly(rolledBack, Collections.emptyList());
       assertMatchesHudi(table, rolledBack, Collections.singleton(commit1));
       assertNothingPending(reconstructedTimeline(table.getBasePath()));
+    }
+  }
+
+  @Test
+  void secondHudiTableOfTheSameNameIsRefusedTheFirstTablesIcebergTable() throws IOException {
+    try (TestJavaHudiTable first = createWithTableConfig(tableName, tempDir, settings)) {
+      first.insertRecords(20, true);
+      List<String> firstFiles = first.getAllLatestBaseFilePaths();
+      // The catalog names the first table's Iceberg table, so the second table must neither
+      // rebuild its timeline from it nor publish into it; its writer refuses it on loading.
+      Path secondDirectory =
+          Files.createDirectories(tempDir.resolve("second_" + UUID.randomUUID()));
+      assertThrows(
+          Exception.class,
+          () -> {
+            try (TestJavaHudiTable second =
+                createWithTableConfig(tableName, secondDirectory, settings)) {
+              second.insertRecords(10, true);
+            }
+          });
+      assertIcebergReferencesExactly(catalog.loadTable(identifier), firstFiles);
+      assertMatchesHudi(first, catalog.loadTable(identifier), Collections.emptySet());
     }
   }
 
