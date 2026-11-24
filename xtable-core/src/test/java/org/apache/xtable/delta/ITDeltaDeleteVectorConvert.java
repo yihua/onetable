@@ -39,8 +39,6 @@ import org.junit.jupiter.api.io.TempDir;
 import org.apache.spark.sql.delta.DeltaLog;
 import org.apache.spark.sql.delta.actions.AddFile;
 
-import scala.Option;
-
 import org.apache.xtable.GenericTable;
 import org.apache.xtable.TestSparkDeltaTable;
 import org.apache.xtable.ValidationTestHelper;
@@ -78,7 +76,7 @@ public class ITDeltaDeleteVectorConvert {
   @AfterAll
   public static void teardown() {
     if (sparkSession != null) {
-      sparkSession.close();
+      sparkSession.stop();
     }
   }
 
@@ -104,6 +102,9 @@ public class ITDeltaDeleteVectorConvert {
             "ALTER TABLE "
                 + tableName
                 + " SET TBLPROPERTIES ('delta.enableDeletionVectors' = true)");
+    // The DeltaTable handle keeps the file format of the snapshot it was created from, which
+    // predates the deletion vectors feature, so DML through it would not see _metadata.row_index.
+    testSparkDeltaTable.reload();
 
     List<List<String>> allActiveFiles = new ArrayList<>();
     List<TableChange> allTableChanges = new ArrayList<>();
@@ -116,11 +117,11 @@ public class ITDeltaDeleteVectorConvert {
     assertEquals(100L, testSparkDeltaTable.getNumRows());
     validateDeletedRecordCount(testSparkDeltaTable.getDeltaLog(), allActiveFiles.size() + 1, 0, 0);
 
-    // upsert does not create delete vectors
+    // since Delta 3, MERGE marks the updated rows in the first file with a deletion vector
     testSparkDeltaTable.upsertRows(rows.subList(0, 20));
     allActiveFiles.add(testSparkDeltaTable.getAllActiveFiles());
     assertEquals(100L, testSparkDeltaTable.getNumRows());
-    validateDeletedRecordCount(testSparkDeltaTable.getDeltaLog(), allActiveFiles.size() + 1, 0, 0);
+    validateDeletedRecordCount(testSparkDeltaTable.getDeltaLog(), allActiveFiles.size() + 1, 1, 20);
 
     testSparkDeltaTable.insertRows(50);
     allActiveFiles.add(testSparkDeltaTable.getAllActiveFiles());
@@ -135,7 +136,7 @@ public class ITDeltaDeleteVectorConvert {
     testSparkDeltaTable.deleteRows(rowsToDelete);
     allActiveFiles.add(testSparkDeltaTable.getAllActiveFiles());
     assertEquals(135L, testSparkDeltaTable.getNumRows());
-    validateDeletedRecordCount(testSparkDeltaTable.getDeltaLog(), allActiveFiles.size() + 1, 2, 15);
+    validateDeletedRecordCount(testSparkDeltaTable.getDeltaLog(), allActiveFiles.size() + 1, 2, 35);
 
     testSparkDeltaTable.insertRows(50);
     allActiveFiles.add(testSparkDeltaTable.getAllActiveFiles());
@@ -148,7 +149,7 @@ public class ITDeltaDeleteVectorConvert {
     testSparkDeltaTable.deleteRows(rowsToDelete);
     allActiveFiles.add(testSparkDeltaTable.getAllActiveFiles());
     assertEquals(178L, testSparkDeltaTable.getNumRows());
-    validateDeletedRecordCount(testSparkDeltaTable.getDeltaLog(), allActiveFiles.size() + 1, 2, 22);
+    validateDeletedRecordCount(testSparkDeltaTable.getDeltaLog(), allActiveFiles.size() + 1, 2, 42);
 
     testSparkDeltaTable.insertRows(50);
     allActiveFiles.add(testSparkDeltaTable.getAllActiveFiles());
@@ -185,7 +186,7 @@ public class ITDeltaDeleteVectorConvert {
   private void validateDeletedRecordCount(
       DeltaLog deltaLog, int version, int deleteVectorFileCount, int deletionRecordCount) {
     List<AddFile> allFiles =
-        deltaLog.getSnapshotAt(version, Option.empty()).allFiles().collectAsList();
+        DeltaSparkShim.getSnapshotAt(deltaLog, version).allFiles().collectAsList();
     List<AddFile> filesWithDeletionVectors =
         allFiles.stream().filter(f -> f.deletionVector() != null).collect(Collectors.toList());
 
