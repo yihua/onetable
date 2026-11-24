@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 
 import lombok.extern.log4j.Log4j2;
 
@@ -99,6 +100,9 @@ public class IcebergConversionTarget implements ConversionTarget {
   private Set<String> uncommittedDeletionVectorFiles = Collections.emptySet();
 
   private boolean stagedDeleteOperation;
+
+  /** Null when every data file the next files diff references has to be in the table. */
+  private Predicate<String> stagedDataFilesWithoutLiveRows;
 
   public IcebergConversionTarget() {}
 
@@ -366,6 +370,18 @@ public class IcebergConversionTarget implements ConversionTarget {
     this.stagedDeleteOperation = true;
   }
 
+  /**
+   * Tells the next {@link #syncFilesForDiff} which data files the source holds no live rows of. A
+   * row delta removes a data file whose rows a delete removes in full, so a later diff of the
+   * source can still reference it; the diff leaves such a file out when the table does not hold it,
+   * see {@link IcebergDataFileUpdatesSync#applyRowDelta}.
+   *
+   * @param withoutLiveRows whether the source holds no live rows of the data file at a path
+   */
+  public void stageDataFilesWithoutLiveRows(Predicate<String> withoutLiveRows) {
+    this.stagedDataFilesWithoutLiveRows = withoutLiveRows;
+  }
+
   @Override
   public void syncFilesForDiff(InternalFilesDiff internalFilesDiff) {
     if (stagedDeletedPositions != null) {
@@ -378,6 +394,7 @@ public class IcebergConversionTarget implements ConversionTarget {
               stagedPartitionsOfDataFiles,
               stagedPositionsReplaceDeletionVectors,
               stagedDeleteOperation,
+              stagedDataFilesWithoutLiveRows,
               transaction.table().schema(),
               transaction.table().spec(),
               tableSyncMetadata);
@@ -518,6 +535,7 @@ public class IcebergConversionTarget implements ConversionTarget {
     stagedPartitionsOfDataFiles = null;
     uncommittedDeletionVectorFiles = Collections.emptySet();
     stagedDeleteOperation = false;
+    stagedDataFilesWithoutLiveRows = null;
   }
 
   private void rollbackCorruptCommits() {

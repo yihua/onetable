@@ -42,6 +42,8 @@ import java.util.stream.Stream;
 import lombok.SneakyThrows;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.spark.SparkConf;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -114,13 +116,39 @@ final class MergeOnReadAssertions {
     return properties;
   }
 
-  /** Rows, live files and deleted keys are the same through Iceberg as through Hudi. */
+  /**
+   * Rows, live files and deleted keys are the same through Iceberg as through Hudi. A file without
+   * a row that is not deleted is left out on both sides: a delete of all its rows removes it from
+   * Iceberg, while an update of all its rows leaves it with a deletion vector of every row.
+   */
   static void assertIcebergMatchesHudi(SparkSession spark, String basePath) {
     assertEquals(hudiRows(spark, basePath), icebergRows(spark, basePath), "rows read");
     assertEquals(
-        deletedKeysByBaseFileInHudi(basePath),
-        deletedKeysByDataFileInIceberg(spark, basePath),
+        withLiveRows(deletedKeysByBaseFileInHudi(basePath)),
+        withLiveRows(deletedKeysByDataFileInIceberg(spark, basePath)),
         "live files with the keys deleted from each");
+  }
+
+  /** The files among the keys of the map that hold a row whose key is not deleted. */
+  static Map<String, Set<String>> withLiveRows(Map<String, Set<String>> deletedKeysByFile) {
+    Map<String, Set<String>> withLiveRows = new TreeMap<>();
+    deletedKeysByFile.forEach(
+        (file, keys) -> {
+          if (keys.size() < rowCount(file)) {
+            withLiveRows.put(file, keys);
+          }
+        });
+    return withLiveRows;
+  }
+
+  @SneakyThrows
+  static long rowCount(String localPath) {
+    try (ParquetFileReader reader =
+        ParquetFileReader.open(
+            HadoopInputFile.fromPath(
+                new org.apache.hadoop.fs.Path(localPath), new Configuration()))) {
+      return reader.getRecordCount();
+    }
   }
 
   static List<String> hudiRows(SparkSession spark, String basePath) {

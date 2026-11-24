@@ -19,6 +19,7 @@
 package org.apache.xtable.iceberg;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -42,6 +43,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -56,10 +58,13 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
@@ -231,6 +236,44 @@ class TestIcebergDeletionVectorSync {
       Map<String, List<Long>> deletedPositions,
       List<List<PartitionValue>> partitionsOfDataFiles,
       boolean replaceDeletionVectors) {
+    apply(
+        table,
+        added,
+        removed,
+        deletedPositions,
+        partitionsOfDataFiles,
+        replaceDeletionVectors,
+        false,
+        null);
+  }
+
+  /** A row delta of a source delete, or not, and which files the source holds no live rows of. */
+  private void applyDelete(
+      Table table,
+      List<InternalDataFile> removed,
+      Map<String, List<Long>> deletedPositions,
+      boolean deleteOperation,
+      Predicate<String> withoutLiveRows) {
+    apply(
+        table,
+        Collections.emptyList(),
+        removed,
+        deletedPositions,
+        Collections.emptyList(),
+        false,
+        deleteOperation,
+        withoutLiveRows);
+  }
+
+  private void apply(
+      Table table,
+      List<InternalDataFile> added,
+      List<InternalDataFile> removed,
+      Map<String, List<Long>> deletedPositions,
+      List<List<PartitionValue>> partitionsOfDataFiles,
+      boolean replaceDeletionVectors,
+      boolean deleteOperation,
+      Predicate<String> withoutLiveRows) {
     Transaction transaction = table.newTransaction();
     sync.applyRowDelta(
         table,
@@ -239,7 +282,8 @@ class TestIcebergDeletionVectorSync {
         deletedPositions,
         partitionsOfDataFiles,
         replaceDeletionVectors,
-        false,
+        deleteOperation,
+        withoutLiveRows,
         transaction.table().schema(),
         transaction.table().spec(),
         TableSyncMetadata.of(Instant.now(), Collections.emptyList()));
@@ -331,6 +375,118 @@ class TestIcebergDeletionVectorSync {
     assertEquals(expected("b", Arrays.asList(2L)), deletedPositions(table));
   }
 
+  private static List<Long> range(long from, long to) {
+    List<Long> positions = new ArrayList<>();
+    for (long position = from; position < to; position++) {
+      positions.add(position);
+    }
+    return positions;
+  }
+
+  private static Map<String, List<Long>> positions(InternalDataFile file, List<Long> positions) {
+    return Collections.singletonMap(file.getPhysicalPath(), positions);
+  }
+
+  @Test
+  void aDeleteOfEveryRowOfAFileRemovesTheFileAndItsDeletionVector() {
+    Table table = newTable(3);
+    InternalDataFile a = dataFile(table, "a");
+    InternalDataFile b = dataFile(table, "b");
+    apply(table, Arrays.asList(a, b), Collections.emptyList(), Collections.emptyMap(), false);
+    applyDelete(table, Collections.emptyList(), positions(a, range(0, 4)), true, null);
+    assertEquals(expected("a", range(0, 4), "b", Arrays.asList()), deletedPositions(table));
+
+    // The rows left in a, with two positions the deletion vector already holds.
+    applyDelete(table, Collections.emptyList(), positions(a, range(2, 10)), true, null);
+    assertEquals(expected("b", Arrays.asList()), deletedPositions(table));
+    Snapshot delete = table.currentSnapshot();
+    assertEquals(DataOperations.DELETE, delete.operation());
+    assertEquals("1", delete.summary().get(SnapshotSummary.DELETED_FILES_PROP));
+    assertEquals("1", delete.summary().get(SnapshotSummary.REMOVED_DVS_PROP));
+    assertNull(delete.summary().get(SnapshotSummary.ADDED_DVS_PROP));
+    assertEquals("10", delete.summary().get(SnapshotSummary.TOTAL_RECORDS_PROP));
+  }
+
+  @Test
+  void aDeleteOfEveryRowOfOneFileAndSomeOfAnotherIsOneRowDelta() {
+    Table table = newTable(3);
+    InternalDataFile a = dataFile(table, "a");
+    InternalDataFile b = dataFile(table, "b");
+    apply(table, Arrays.asList(a, b), Collections.emptyList(), Collections.emptyMap(), false);
+    Map<String, List<Long>> deletes = new LinkedHashMap<>();
+    deletes.put(a.getPhysicalPath(), range(0, 10));
+    deletes.put(b.getPhysicalPath(), Arrays.asList(3L));
+    applyDelete(table, Collections.emptyList(), deletes, true, null);
+
+    assertEquals(expected("b", Arrays.asList(3L)), deletedPositions(table));
+    Snapshot delete = table.currentSnapshot();
+    assertEquals(DataOperations.DELETE, delete.operation());
+    assertEquals("1", delete.summary().get(SnapshotSummary.DELETED_FILES_PROP));
+    assertEquals("1", delete.summary().get(SnapshotSummary.ADDED_DVS_PROP));
+  }
+
+  @Test
+  void anUpdateOfEveryRowOfAFileKeepsTheFileWithADeletionVector() {
+    Table table = newTable(3);
+    InternalDataFile a = dataFile(table, "a");
+    apply(table, Arrays.asList(a), Collections.emptyList(), Collections.emptyMap(), false);
+    applyDelete(table, Collections.emptyList(), positions(a, range(0, 10)), false, null);
+    assertEquals(expected("a", range(0, 10)), deletedPositions(table));
+  }
+
+  @Test
+  void aFileThatAWholeDeleteRemovedIsLeftOutOfLaterDiffsWhenItHoldsNoLiveRows() {
+    Table table = newTable(3);
+    InternalDataFile a = dataFile(table, "a");
+    InternalDataFile b = dataFile(table, "b");
+    apply(table, Arrays.asList(a, b), Collections.emptyList(), Collections.emptyMap(), false);
+    applyDelete(table, Collections.emptyList(), positions(a, range(0, 10)), true, null);
+    long snapshot = table.currentSnapshot().snapshotId();
+
+    // Deleting rows of a again, or removing it, fails unless the source holds no live rows of it.
+    Predicate<String> aHoldsNoLiveRows = a.getPhysicalPath()::equals;
+    assertThrows(
+        UpdateException.class,
+        () -> applyDelete(table, Collections.emptyList(), positions(a, 1L), false, path -> false));
+    assertThrows(
+        ValidationException.class,
+        () -> applyDelete(table, Arrays.asList(a), Collections.emptyMap(), false, path -> false));
+    table.refresh();
+    assertEquals(snapshot, table.currentSnapshot().snapshotId());
+
+    applyDelete(table, Collections.emptyList(), positions(a, 1L), true, aHoldsNoLiveRows);
+    assertEquals(DataOperations.DELETE, table.currentSnapshot().operation());
+    Map<String, List<Long>> deletes = new LinkedHashMap<>();
+    deletes.put(a.getPhysicalPath(), Arrays.asList(1L));
+    deletes.put(b.getPhysicalPath(), Arrays.asList(2L));
+    applyDelete(table, Collections.emptyList(), deletes, false, aHoldsNoLiveRows);
+    assertEquals(expected("b", Arrays.asList(2L)), deletedPositions(table));
+    InternalDataFile c = dataFile(table, "c");
+    apply(
+        table,
+        Arrays.asList(c),
+        Arrays.asList(a, b),
+        Collections.emptyMap(),
+        Collections.emptyList(),
+        false,
+        false,
+        aHoldsNoLiveRows);
+    assertEquals(expected("c", Arrays.asList()), deletedPositions(table));
+
+    // A file that is not in the table for any other reason still fails the commit.
+    InternalDataFile unknown = dataFile(table, "unknown");
+    assertThrows(
+        UpdateException.class,
+        () ->
+            applyDelete(
+                table, Collections.emptyList(), positions(unknown, 1L), false, aHoldsNoLiveRows));
+    assertThrows(
+        ValidationException.class,
+        () ->
+            applyDelete(
+                table, Arrays.asList(unknown), Collections.emptyMap(), false, aHoldsNoLiveRows));
+  }
+
   @Test
   void positionsOfAFileThatIsNotLiveFailTheCommit() {
     Table table = newTable(3);
@@ -398,6 +554,7 @@ class TestIcebergDeletionVectorSync {
         Collections.emptyList(),
         false,
         false,
+        null,
         transaction.table().schema(),
         transaction.table().spec(),
         TableSyncMetadata.of(Instant.now(), Collections.emptyList()));

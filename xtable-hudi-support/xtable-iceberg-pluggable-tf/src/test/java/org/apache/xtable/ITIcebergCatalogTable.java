@@ -24,12 +24,15 @@ import static org.apache.xtable.IcebergTableAssertions.completedCommitTimes;
 import static org.apache.xtable.IcebergTableAssertions.createWithTableConfig;
 import static org.apache.xtable.IcebergTableAssertions.icebergTableExists;
 import static org.apache.xtable.IcebergTableAssertions.reconstructedTimeline;
+import static org.apache.xtable.MergeOnReadAssertions.deletedKeysByBaseFileInHudi;
+import static org.apache.xtable.MergeOnReadAssertions.withLiveRows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -259,14 +262,21 @@ class ITIcebergCatalogTable {
       assertEquals(
           filesInPartition, scans.get(0).scanMetrics().resultDataFiles().value(), scans.toString());
       Table icebergTable = reportingCatalog.loadTable(identifier);
-      assertMatchesHudi(table, icebergTable, Collections.emptySet());
-      long deletedRows = 0;
+      // A delete of the only rows of a base file removes the data file instead.
+      assertMatchesHudi(
+          table,
+          icebergTable,
+          Collections.emptySet(),
+          new ArrayList<>(withLiveRows(deletedKeysByBaseFileInHudi(table.getBasePath())).keySet()));
+      long liveRows = 0;
       try (CloseableIterable<FileScanTask> tasks = icebergTable.newScan().planFiles()) {
         for (FileScanTask task : tasks) {
-          deletedRows += task.deletes().stream().mapToLong(DeleteFile::recordCount).sum();
+          liveRows +=
+              task.file().recordCount()
+                  - task.deletes().stream().mapToLong(DeleteFile::recordCount).sum();
         }
       }
-      assertEquals(deletes.size(), deletedRows);
+      assertEquals(inserts.size() - deletes.size(), liveRows);
     }
   }
 
@@ -277,7 +287,15 @@ class ITIcebergCatalogTable {
    */
   private static void assertMatchesHudi(
       TestJavaHudiTable table, Table icebergTable, Set<String> rolledBackCommits) {
-    assertIcebergReferencesExactly(icebergTable, table.getAllLatestBaseFilePaths());
+    assertMatchesHudi(table, icebergTable, rolledBackCommits, table.getAllLatestBaseFilePaths());
+  }
+
+  private static void assertMatchesHudi(
+      TestJavaHudiTable table,
+      Table icebergTable,
+      Set<String> rolledBackCommits,
+      List<String> expectedBaseFiles) {
+    assertIcebergReferencesExactly(icebergTable, expectedBaseFiles);
     HoodieTableMetaClient metaClient = table.getMetaClient();
     Set<String> completed =
         metaClient
