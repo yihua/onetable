@@ -47,6 +47,7 @@ import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.util.HoodieStorageUtils;
 import org.apache.hudi.common.util.ParquetUtils;
+import org.apache.hudi.core.io.storage.HoodieIOFactory;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.storage.StorageConfiguration;
 import org.apache.hudi.storage.StoragePath;
@@ -199,9 +200,10 @@ final class IcebergRowLineage {
    * while it stays in the table: a rollback that restores it adds it again with a new one, so only
    * the current snapshot gives the values Iceberg readers see.
    *
-   * @return null when the Iceberg table is below format version 3, which has no row lineage to keep
-   * @throws HoodieException when the base file is not in the current snapshot, or Iceberg has no
-   *     first row id for it
+   * @return null when there is no row lineage to keep: the Iceberg table is below format version 3,
+   *     or the base file holds no rows, which the table format leaves out of Iceberg
+   * @throws HoodieException when a base file that holds rows is not in the current snapshot, or
+   *     Iceberg has no first row id for it
    */
   private static BaseFileLineage lookUp(HoodieTableMetaClient metaClient, HoodieBaseFile baseFile) {
     String tableName = metaClient.getTableConfig().getTableName();
@@ -233,6 +235,9 @@ final class IcebergRowLineage {
               .get(path);
     }
     if (lineage == null) {
+      if (holdsNoRows(metaClient, baseFile)) {
+        return null;
+      }
       throw notInSnapshot(tableName, path, snapshot.snapshotId());
     }
     if (lineage.firstRowId == null) {
@@ -243,6 +248,14 @@ final class IcebergRowLineage {
               path, tableName, snapshot.snapshotId()));
     }
     return lineage;
+  }
+
+  private static boolean holdsNoRows(HoodieTableMetaClient metaClient, HoodieBaseFile baseFile) {
+    StoragePath path = baseFile.getStoragePath();
+    return HoodieIOFactory.getIOFactory(metaClient.getStorage())
+            .getFileFormatUtils(path)
+            .getRowCount(metaClient.getStorage(), path)
+        == 0;
   }
 
   /** The Iceberg table of the Hudi table, loaded once per process and refreshed on every use. */

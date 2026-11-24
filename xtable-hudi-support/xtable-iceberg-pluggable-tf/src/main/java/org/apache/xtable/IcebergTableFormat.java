@@ -94,6 +94,9 @@ import org.apache.xtable.model.schema.InternalPartitionField;
 import org.apache.xtable.model.schema.PartitionTransformType;
 import org.apache.xtable.model.stat.PartitionValue;
 import org.apache.xtable.model.storage.DataLayoutStrategy;
+import org.apache.xtable.model.storage.InternalDataFile;
+import org.apache.xtable.model.storage.InternalFile;
+import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.sync.SyncResult;
 import org.apache.xtable.model.sync.SyncStatusCode;
 import org.apache.xtable.spi.sync.TableFormatSync;
@@ -499,6 +502,8 @@ public class IcebergTableFormat implements HoodieTableFormat {
               .tableChanges(tableChanges.iterator())
               .pendingCommits(changes.getPendingCommits())
               .build();
+    } else {
+      changes = withoutAddedFilesWithoutRows(changes);
     }
     if (deleteOperation) {
       target.stageDeleteOperation();
@@ -515,6 +520,42 @@ public class IcebergTableFormat implements HoodieTableFormat {
       throw new UpdateException("Failed to update iceberg metadata", e);
     }
     failUnlessSynced(results);
+  }
+
+  /**
+   * Leaves the data files without rows out of the files an instant adds. A copy-on-write delete of
+   * every row of a file group writes a base file without rows, where Iceberg removes the data file,
+   * so the snapshot is a delete as Iceberg's own writer publishes it. A later instant that replaces
+   * such a file then removes a path Iceberg does not hold, which an overwrite ignores; a row delta
+   * fails on it, which is why only the diffs published without deletion vectors are filtered.
+   */
+  private static IncrementalTableChanges withoutAddedFilesWithoutRows(
+      IncrementalTableChanges changes) {
+    List<TableChange> tableChanges = new ArrayList<>();
+    changes
+        .getTableChanges()
+        .forEachRemaining(change -> tableChanges.add(withoutAddedFilesWithoutRows(change)));
+    return IncrementalTableChanges.builder()
+        .tableChanges(tableChanges.iterator())
+        .pendingCommits(changes.getPendingCommits())
+        .build();
+  }
+
+  private static TableChange withoutAddedFilesWithoutRows(TableChange change) {
+    List<InternalFile> filesAdded =
+        change.getFilesDiff().getFilesAdded().stream()
+            .filter(
+                file ->
+                    !(file instanceof InternalDataFile)
+                        || ((InternalDataFile) file).getRecordCount() > 0)
+            .collect(Collectors.toList());
+    return change.toBuilder()
+        .filesDiff(
+            InternalFilesDiff.builder()
+                .filesAdded(filesAdded)
+                .filesRemoved(change.getFilesDiff().getFilesRemoved())
+                .build())
+        .build();
   }
 
   /**

@@ -40,6 +40,7 @@ import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.core.io.storage.HoodieIOFactory;
 import org.apache.hudi.storage.StoragePath;
 
 import org.apache.iceberg.FileScanTask;
@@ -84,6 +85,21 @@ final class IcebergTableAssertions {
     for (String path : referenced) {
       assertTrue(Files.exists(Paths.get(path)), "Iceberg references a missing file: " + path);
     }
+  }
+
+  /**
+   * The given Hudi base files that hold rows. A base file without rows, which a delete of every row
+   * of a file group writes, is left out of Iceberg.
+   */
+  static List<String> baseFilesWithRows(HoodieTableMetaClient metaClient, List<String> baseFiles) {
+    return baseFiles.stream()
+        .filter(
+            path ->
+                HoodieIOFactory.getIOFactory(metaClient.getStorage())
+                        .getFileFormatUtils(new StoragePath(path))
+                        .getRowCount(metaClient.getStorage(), new StoragePath(path))
+                    > 0)
+        .collect(Collectors.toList());
   }
 
   /**
