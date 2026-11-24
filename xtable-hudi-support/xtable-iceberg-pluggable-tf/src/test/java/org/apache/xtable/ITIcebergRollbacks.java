@@ -122,6 +122,37 @@ class ITIcebergRollbacks {
   }
 
   @Test
+  void rollbackInAPartitionWhoseValueHasASpaceRemovesTheRolledBackFiles() {
+    String tableName = "rollback_" + UUID.randomUUID();
+    try (TestJavaHudiTable table =
+        TestJavaHudiTable.forStandardSchemaAtBasePath(
+            tableName,
+            tempDir.resolve(tableName).toString(),
+            "level:SIMPLE",
+            HoodieTableType.COPY_ON_WRITE,
+            new Properties())) {
+      // Rollback metadata spells the deleted paths of a base path without a scheme as plain
+      // strings; a space or a percent sign in a partition value must not be percent-encoded on the
+      // way to Iceberg, which holds the files under the unencoded spelling and ignores a delete it
+      // cannot match.
+      List<HoodieRecord<HoodieAvroPayload>> inserts = table.insertRecords(50, "us west", true);
+      table.insertRecords(50, "50%off", true);
+      List<String> filesAfterInsert = table.getAllLatestBaseFilePaths();
+      table.upsertRecords(inserts.subList(0, 10), true);
+      String upsertCommit =
+          table.getMetaClient().reloadActiveTimeline().lastInstant().get().requestedTime();
+
+      table.rollback(upsertCommit);
+
+      assertIcebergReferencesExactly(table.getBasePath(), filesAfterInsert);
+      assertEquals(100, icebergRowCount(table.getBasePath()));
+      table.insertRecords(20, "us west", true);
+      assertIcebergReferencesExactly(table.getBasePath(), table.getAllLatestBaseFilePaths());
+      assertEquals(120, icebergRowCount(table.getBasePath()));
+    }
+  }
+
+  @Test
   void rollbackOfAClusteringRestoresTheReplacedFileGroups() {
     try (TestJavaHudiTable table = newTable()) {
       table.insertRecords(100, true);
