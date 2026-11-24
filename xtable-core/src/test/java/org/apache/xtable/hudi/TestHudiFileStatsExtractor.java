@@ -21,6 +21,7 @@ package org.apache.xtable.hudi;
 import static org.apache.hudi.hadoop.fs.HadoopFSUtils.getStorageConf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -300,6 +301,11 @@ public class TestHudiFileStatsExtractor {
             .collect(Collectors.toMap(stat -> stat.getField().getPath(), stat -> stat));
     assertEquals(1, statsByPath.get("id").getRange().getMinValue());
     assertEquals(-1, statsByPath.get("s.c1").getRange().getMinValue());
+    // The element of the list of primitives maps to its field in either list layout.
+    ColumnStat element = statsByPath.get("s.a._one_field_element");
+    assertNotNull(element, "no stats for the list element: " + statsByPath.keySet());
+    assertEquals(1, element.getRange().getMinValue());
+    assertEquals(2, element.getRange().getMaxValue());
   }
 
   @Test

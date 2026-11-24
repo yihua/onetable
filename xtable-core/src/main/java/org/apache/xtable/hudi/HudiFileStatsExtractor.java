@@ -241,8 +241,8 @@ public class HudiFileStatsExtractor {
             HadoopFSUtils.convertToStoragePath(filePath),
             columnNames,
             indexVersion);
-    // A range can name a column that maps to no field, such as the element of a list of
-    // primitives written in Parquet's two-level list layout.
+    // A range whose column name maps to no field is skipped, so an unexpected name costs the stats
+    // of that column and not the publish.
     List<ColumnStat> columnStats =
         columnRanges.stream()
             .filter(colRange -> nameFieldMap.containsKey(colRange.getColumnName()))
