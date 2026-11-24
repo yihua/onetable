@@ -33,6 +33,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import lombok.extern.log4j.Log4j2;
+
 import org.apache.hadoop.conf.Configuration;
 
 import org.apache.hudi.avro.model.HoodieCleanMetadata;
@@ -93,6 +95,7 @@ import org.apache.xtable.timeline.IcebergSnapshotInstants;
 import org.apache.xtable.timeline.IcebergTimelineArchiver;
 import org.apache.xtable.timeline.IcebergTimelineFactory;
 
+@Log4j2
 public class IcebergTableFormat implements HoodieTableFormat {
   /**
    * The partition type a custom key generator records for a field whose value is the partition path
@@ -162,21 +165,18 @@ public class IcebergTableFormat implements HoodieTableFormat {
                 metaClient.getActiveTimeline().filterCompletedInstants().lastInstant().get());
     List<HoodieInstant> archived = archivedInstants.get();
     archiveInstants(metaClient, internalTable, archived);
-    requireArchivedCommitsCompactedInMetadataTable(engineContext, metaClient, archived);
+    warnIfArchivedAheadOfMetadataTableCompaction(engineContext, metaClient, archived);
   }
 
   /**
-   * Hudi's archiver keeps a commit active until the metadata table has compacted its log block,
-   * since the metadata table reader only trusts blocks of commits still on the active timeline, but
-   * it applies that bound to the native format only. Under this format the archiver can run ahead
-   * of the compaction, and Hudi then stops listing the archived commits' files while Iceberg still
-   * reads them. The instants are already archived when this hook runs, so the damage cannot be
-   * prevented here; it is reported instead of being left silent.
-   *
-   * @throws IllegalStateException when an archived commit is newer than the metadata table's latest
-   *     compaction
+   * Hudi's archiver keeps a commit active until the metadata table has compacted its log block, but
+   * applies that bound to the native format only, so under this format the archiver can run ahead
+   * of the compaction. The instants are already archived when this hook runs, and the write has
+   * committed in Hudi and Iceberg, so this only warns: failing here would fail a committed write. A
+   * metadata table without a compaction yet, such as a freshly built one, is not reported, and
+   * neither is one that cannot be read, as when this write turned it off.
    */
-  static void requireArchivedCommitsCompactedInMetadataTable(
+  static void warnIfArchivedAheadOfMetadataTableCompaction(
       HoodieEngineContext engineContext,
       HoodieTableMetaClient metaClient,
       List<HoodieInstant> archivedInstants) {
@@ -203,25 +203,22 @@ public class IcebergTableFormat implements HoodieTableFormat {
                 false)) {
       latestCompaction = metadata.getLatestCompactionTime();
     } catch (Exception e) {
-      throw new ReadException("Unable to read the metadata table's latest compaction", e);
+      log.warn("Unable to read the latest compaction of the Hudi metadata table", e);
+      return;
     }
-    if (!latestCompaction.isPresent()
-        || InstantComparison.compareTimestamps(
+    if (latestCompaction.isPresent()
+        && InstantComparison.compareTimestamps(
             latestArchivedCommit.get().requestedTime(),
             InstantComparison.GREATER_THAN_OR_EQUALS,
             latestCompaction.get())) {
-      throw new IllegalStateException(
-          String.format(
-              "Table %s archived %s before the Hudi metadata table compacted it (latest metadata"
-                  + " table compaction: %s), so Hudi no longer lists that commit's files; keep"
-                  + " %s above %s, and rebuild the metadata table by rewriting it with"
-                  + " %s=false and then true",
-              metaClient.getTableConfig().getTableName(),
-              latestArchivedCommit.get(),
-              latestCompaction.isPresent() ? latestCompaction.get() : "none",
-              HoodieArchivalConfig.MIN_COMMITS_TO_KEEP.key(),
-              HoodieMetadataConfig.COMPACT_NUM_DELTA_COMMITS.key(),
-              HoodieMetadataConfig.ENABLE.key()));
+      log.warn(
+          "Table {} archived {} before the Hudi metadata table compacted it (latest metadata table"
+              + " compaction: {}); keep {} above {} so the metadata table listing stays complete",
+          metaClient.getTableConfig().getTableName(),
+          latestArchivedCommit.get(),
+          latestCompaction.get(),
+          HoodieArchivalConfig.MIN_COMMITS_TO_KEEP.key(),
+          HoodieMetadataConfig.COMPACT_NUM_DELTA_COMMITS.key());
     }
   }
 

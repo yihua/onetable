@@ -238,10 +238,10 @@ class ITIcebergMetadataTable {
   }
 
   @Test
-  void archivalAheadOfTheMetadataTableCompactionIsReported() {
-    // Hudi bounds archival by the metadata table's compaction for the native format only, so a
-    // writer archiving faster than the default compaction interval loses the archived commits'
-    // files from Hudi's listing; the archive hook cannot prevent it and reports it instead.
+  void archivalBeforeTheFirstMetadataTableCompactionKeepsWriting() throws IOException {
+    // A metadata table built with the table has no compaction until the default interval of delta
+    // commits, while the harness archives once five commits are active. The archive hook runs after
+    // the write committed in Hudi and Iceberg, so it must not fail it.
     try (TestJavaHudiTable table =
         TestJavaHudiTable.forStandardSchema(
             "mdt_" + UUID.randomUUID(),
@@ -250,24 +250,26 @@ class ITIcebergMetadataTable {
             HoodieTableType.COPY_ON_WRITE,
             HoodieArchivalConfig.newBuilder().archiveCommitsWith(3, 4).build(),
             metadataTableEnabled())) {
-      Exception exception =
-          assertThrows(
-              Exception.class,
-              () -> {
-                for (int i = 0; i < 8; i++) {
-                  table.insertRecords(10, true);
-                }
-              });
-      Throwable cause = exception;
-      while (!(cause instanceof IllegalStateException)
-          && cause.getCause() != null
-          && cause.getCause() != cause) {
-        cause = cause.getCause();
+      for (int i = 0; i < 8; i++) {
+        table.insertRecords(10, true);
       }
       assertTrue(
-          cause instanceof IllegalStateException
-              && cause.getMessage().contains(HoodieArchivalConfig.MIN_COMMITS_TO_KEEP.key()),
-          "archival ahead of the metadata table compaction must be reported: " + exception);
+          table.getMetaClient().getArchivedTimeline().reload().countInstants() > 0,
+          "the writes must have archived commits");
+      Set<String> listedByStorage =
+          table.getAllLatestBaseFilePaths().stream()
+              .map(path -> new StoragePath(path).toUri().getPath())
+              .collect(Collectors.toSet());
+      Set<String> listedByMetadataTable = new HashSet<>();
+      HoodieTableMetadata metadata = tableMetadata(table);
+      for (String partition : metadata.getAllPartitionPaths()) {
+        metadata
+            .getAllFilesInPartition(new StoragePath(table.getBasePath(), partition))
+            .forEach(file -> listedByMetadataTable.add(file.getPath().toUri().getPath()));
+      }
+      assertEquals(listedByStorage, listedByMetadataTable);
+      assertIcebergReferencesExactly(table.getBasePath(), table.getAllLatestBaseFilePaths());
+      assertEquals(80, icebergRowCount(table.getBasePath()));
     }
   }
 
