@@ -23,9 +23,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -34,6 +36,8 @@ import lombok.SneakyThrows;
 import org.apache.hadoop.conf.Configuration;
 
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
@@ -46,7 +50,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
 
-/** Assertions shared by the integration tests that compare the Iceberg table against Hudi. */
+/** Helpers shared by the integration tests that compare the Iceberg table against Hudi. */
 final class IcebergTableAssertions {
   private IcebergTableAssertions() {}
 
@@ -58,11 +62,15 @@ final class IcebergTableAssertions {
     return new HadoopTables(new Configuration()).exists(basePath);
   }
 
+  static void assertIcebergReferencesExactly(String basePath, List<String> expectedBaseFiles) {
+    assertIcebergReferencesExactly(icebergTable(basePath), expectedBaseFiles);
+  }
+
   /** Iceberg plans exactly the given Hudi base files, and each of them exists on storage. */
   @SneakyThrows
-  static void assertIcebergReferencesExactly(String basePath, List<String> expectedBaseFiles) {
+  static void assertIcebergReferencesExactly(Table icebergTable, List<String> expectedBaseFiles) {
     Set<String> referenced = new HashSet<>();
-    try (CloseableIterable<FileScanTask> tasks = icebergTable(basePath).newScan().planFiles()) {
+    try (CloseableIterable<FileScanTask> tasks = icebergTable.newScan().planFiles()) {
       for (FileScanTask task : tasks) {
         referenced.add(new StoragePath(task.file().path().toString()).toUri().getPath());
       }
@@ -125,5 +133,22 @@ final class IcebergTableAssertions {
         timeline.filterInflightsAndRequested().empty(),
         "no instant should be left pending: "
             + timeline.filterInflightsAndRequested().getInstants());
+  }
+
+  /**
+   * Hudi does not copy writer properties under {@code hoodie.table.format.} into {@code
+   * hoodie.properties} when it creates a table, so the settings are written before the first commit
+   * and the table is opened again to pick them up.
+   */
+  static TestJavaHudiTable createWithTableConfig(
+      String tableName, Path tempDir, Properties settings) {
+    try (TestJavaHudiTable created =
+        TestJavaHudiTable.forStandardSchema(
+            tableName, tempDir, null, HoodieTableType.COPY_ON_WRITE)) {
+      HoodieTableMetaClient metaClient = created.getMetaClient();
+      HoodieTableConfig.update(metaClient.getStorage(), metaClient.getMetaPath(), settings);
+    }
+    return TestJavaHudiTable.forStandardSchema(
+        tableName, tempDir, null, HoodieTableType.COPY_ON_WRITE);
   }
 }
