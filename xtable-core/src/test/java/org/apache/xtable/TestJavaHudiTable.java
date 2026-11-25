@@ -26,6 +26,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
@@ -498,6 +499,11 @@ public class TestJavaHudiTable extends TestAbstractHudiTable {
         HoodieWriteConfig.newBuilder()
             .withPopulateMetaFields(!addFieldIds)
             .withProperties(generateWriteConfig(schema, keyGenProperties).getProps())
+            // Hudi 1.3 reads the meta fields mode from its own key, which defaults to ALL
+            .withProps(
+                addFieldIds
+                    ? Collections.singletonMap("hoodie.meta.fields.mode", "NONE")
+                    : Collections.emptyMap())
             .withClusteringConfig(
                 HoodieClusteringConfig.newBuilder()
                     .withClusteringPlanStrategyClass(
