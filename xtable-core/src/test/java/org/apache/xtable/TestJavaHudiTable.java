@@ -26,6 +26,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
@@ -40,12 +41,12 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.hadoop.conf.Configuration;
 
-import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.client.HoodieJavaWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.clustering.plan.strategy.JavaSizeBasedClusteringPlanStrategy;
 import org.apache.hudi.client.clustering.run.strategy.JavaSortAndSizeExecutionStrategy;
 import org.apache.hudi.client.common.HoodieJavaEngineContext;
+import org.apache.hudi.common.avro.HoodieAvroUtils;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.HoodieAvroPayload;
@@ -498,6 +499,11 @@ public class TestJavaHudiTable extends TestAbstractHudiTable {
         HoodieWriteConfig.newBuilder()
             .withPopulateMetaFields(!addFieldIds)
             .withProperties(generateWriteConfig(schema, keyGenProperties).getProps())
+            // Hudi 1.3 reads the meta fields mode from its own key, which defaults to ALL
+            .withProps(
+                addFieldIds
+                    ? Collections.singletonMap("hoodie.meta.fields.mode", "NONE")
+                    : Collections.emptyMap())
             .withClusteringConfig(
                 HoodieClusteringConfig.newBuilder()
                     .withClusteringPlanStrategyClass(
